@@ -10,6 +10,8 @@
 // In both cases the outfit gets the chosen name and rarity, a new EntitlementID, is unlocked from the start and free,
 // and its palettes get names, new IDs and are free. CodaGame/SuitMods/<id>.json tells the SuitRegistry DLL which game
 // registry entries to clone for the new packages.
+// Add-on paks (hair, weapon, ... made for the same suit) are merged in as if they were part of the mod: the files of
+// theirs that the suit uses are cloned with it, and everything goes into the one patched pak.
 #include "patcher.h"
 #include <ctype.h>
 #include <math.h>
@@ -19,6 +21,7 @@
 struct mod_file {
     char *path;                                                 // as in the mod pak
     pak_entry e;
+    int src;                                                    // 0 = the mod, k + 1 = add-on k
     int pkg;                                                    // mod package index, -1 = not part of a package
     char ext[16];
     int drop;                                                   // left out of the patched pak
@@ -29,6 +32,7 @@ struct mod_pkg {
     char *prefix;                                               // pak path up to and with "Content/"
     int override;                                               // the game has this package too
     int fu, fe;                                                 // .uasset / .uexp file
+    int src;                                                    // where its .uasset comes from (mod_file.src)
     char *cls;                                                  // class of its main export
     int in_clone;                                               // moved to a new name
 };
@@ -110,7 +114,7 @@ static int ends_with(const char *s, const char *e)
 static uint8_t *mod_read(analysis *a, int file, size_t *n)
 {
     mod_file *f = &a->files[file];
-    uint8_t *d = pak_read(&a->mod, &f->e, 1);
+    uint8_t *d = pak_read(f->src ? &a->addon[f->src - 1] : &a->mod, &f->e, 1);
     *n = (size_t)f->e.usize;
     return d;
 }
@@ -188,6 +192,13 @@ static int node_of(graph *gr, const char *path)
 
 static int bits_any(graph *gr, const uint64_t *b) { for (int i = 0; i < gr->words; i++) if (b[i]) return 1; return 0; }
 static int bits_count(graph *gr, const uint64_t *b) { int n = 0; for (int i = 0; i < gr->words; i++) n += __builtin_popcountll(b[i]); return n; }
+// bits below `upto` only (the mod's own files come first, the add-ons' after them)
+static int bits_count_upto(const uint64_t *b, int upto)
+{
+    int n = 0;
+    for (int i = 0; i < upto; i++) n += (int)(b[i / 64] >> (i % 64)) & 1;
+    return n;
+}
 
 static void reach(graph *gr, int id, int root)
 {
@@ -208,8 +219,10 @@ static void reach(graph *gr, int id, int root)
         char **refs = upkg_refs(p, &nr);
         upkg_free(p);
         for (int i = 0; i < nr; i++) {
-            // don't wander from one item into other items (palettes list their outfits, outfits their palettes)
-            if (_stricmp(refs[i], path) && (!is_item_dir(refs[i]) || root) && is_indexed(gr->c, refs[i]) &&
+            // don't wander from one item into other items (palettes list their outfits, outfits their palettes), nor
+            // into the hero's character template (it leads to everything the hero uses)
+            if (_stricmp(refs[i], path) && (!is_item_dir(refs[i]) || root) && !strstr(refs[i], "/Templates/Characters/") &&
+                is_indexed(gr->c, refs[i]) &&
                 !(is_item_dir(refs[i]) && strstr(refs[i], "/TacticalOutfits/") && strstr(path, "/Palettes/"))) {
                 int k = node_of(gr, refs[i]);
                 node *nd = &gr->v[id];
@@ -258,6 +271,10 @@ static char *obj_path(const char *pkg)
     sprintf(o, "%s.%s", pkg, s);
     return o;
 }
+
+// what a suit can bring of its own instead of the hero's defaults (outfit property, analysis.look index)
+static const char *LOOK_PROP[NLOOKS] = {"HeadMesh", "HairMesh"};
+static const char *LOOK_WHAT[NLOOKS] = {"head", "hair"};
 
 static void add_item(analysis *a, const char *game, int mod, int kind, int rename)
 {
@@ -364,9 +381,12 @@ static void list_registries(const char *path, void *p)
     l->v[l->n++] = xstrdup(path);
 }
 
+static char *keep_name(const char *s, void *ctx) { (void)s; (void)ctx; return NULL; }
+
 // ok[i] = 1 if /Game package paths[i] has an entry in every one of the game's registries (the SuitRegistry DLL
-// clones each source from each registry, and stops if one is missing)
-static void check_registered(analysis *a, char **paths, int n, int *ok)
+// clones each source from each registry, and stops if one is missing). With try_clone, an entry the SuitRegistry
+// can't clone (e.g. a blueprint's, with export path tags) counts as missing: the copy goes without one.
+static void check_registered(analysis *a, char **paths, int n, int *ok, int try_clone)
 {
     for (int i = 0; i < n; i++) ok[i] = 1;
     path_list l = {0};
@@ -380,6 +400,16 @@ static void check_registered(analysis *a, char **paths, int n, int *ok)
             if (!ok[i]) continue;
             char *op = obj_path(paths[i]);
             ok[i] = reg_has(r, op);
+            if (ok[i] && try_clone) {
+                jmp_buf j, *outer = sr_jmp;
+                sr_jmp = &j;
+                if (setjmp(j)) {
+                    ok[i] = 0;
+                    log_msg("note: the SuitRegistry can't copy the registry entry of %s (%s); its copy goes without "
+                            "one (the game loads it by its path)", upkg_short(paths[i]), sr_error);
+                } else reg_clone(r, op, keep_name, NULL);
+                sr_jmp = outer;
+            }
             free(op);
         }
         reg_free(r);
@@ -446,7 +476,45 @@ static wchar_t *patched_path(const wchar_t *orig)
     return r;
 }
 
-analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
+static int is_bak(const wchar_t *p)
+{
+    size_t n = wcslen(p);
+    return n > 4 && !_wcsicmp(p + n - 4, L".bak");
+}
+
+// <p> without a trailing ".bak"
+static wchar_t *strip_bak(const wchar_t *p)
+{
+    wchar_t *r = _wcsdup(p);
+    if (is_bak(r)) r[wcslen(r) - 4] = 0;
+    return r;
+}
+
+static const wchar_t *file_part(const wchar_t *p)
+{
+    const wchar_t *s = wcsrchr(p, L'\\');
+    return s ? s + 1 : p;
+}
+
+// <folder of beside>\<name><ext>
+static wchar_t *beside(const wchar_t *path, const wchar_t *name, const wchar_t *ext)
+{
+    size_t dl = (size_t)(file_part(path) - path), n = dl + wcslen(name) + wcslen(ext) + 1;
+    wchar_t *r = xmalloc(n * sizeof(wchar_t));
+    wmemcpy(r, path, dl);
+    swprintf(r + dl, n - dl, L"%ls%ls", name, ext);
+    return r;
+}
+
+static int file_exists(const wchar_t *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
+
+// a file name from a manifest, as a wide string (NULL if it isn't a plain file name)
+static wchar_t *manifest_name(json *j)
+{
+    return j && j->t == J_STR && j->s[0] && !strpbrk(j->s, "\\/:") ? utf8_to_w(j->s) : NULL;
+}
+
+analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *const *addons, int naddons, const wchar_t *game_paks)
 {
     analysis *a = xcalloc(1, sizeof *a);
     patcher_need_game = 0;
@@ -456,7 +524,7 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
     if (r) sr_fail("this file is not a pak file Midnight Suns can read");
     int nf;
     pak_entry *e = pak_list(&a->mod, mod_dir_filter, NULL, &nf);
-    // already patched (our manifest)? then start again from the backup of the original
+    // already patched (our manifest)? then start again from the backup of the original (and of its add-ons)
     for (int i = 0; i < nf; i++) {
         if (_strnicmp(e[i].path, "CodaGame/SuitMods/", 18) || !ends_with(e[i].path, ".json")) continue;
         uint8_t *d = pak_read(&a->mod, &e[i], 1);
@@ -464,31 +532,39 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
         json *pj = j ? json_get(j, "patcher") : NULL;
         int ours = pj != NULL;
         // the original's file name, so its backup is found when this pak was renamed to <name>_patched
-        json *oj = pj ? json_get(pj, "original") : NULL;
-        wchar_t *orig_name = oj && oj->t == J_STR && oj->s[0] && !strpbrk(oj->s, "\\/:") ? utf8_to_w(oj->s) : NULL;
+        wchar_t *orig_name = manifest_name(pj ? json_get(pj, "original") : NULL);
+        json *aj = pj ? json_get(pj, "addons") : NULL;
+        wchar_t *prev[MAX_ADDONS];
+        int nprev = 0;
+        for (int k = 0; aj && aj->t == J_ARR && k < aj->n && nprev < MAX_ADDONS; k++)
+            if ((prev[nprev] = manifest_name(aj->items[k]))) nprev++;
         json_free(j);
         free(d);
-        size_t pl = wcslen(pak_path);
-        if (ours && !(pl > 4 && !_wcsicmp(pak_path + pl - 4, L".bak"))) {
-            wchar_t *bak;
-            if (orig_name) {
-                const wchar_t *fn = wcsrchr(pak_path, L'\\');
-                size_t dl = fn ? (size_t)(fn + 1 - pak_path) : 0, bl = dl + wcslen(orig_name) + 8;
-                bak = xmalloc(bl * sizeof(wchar_t));
-                wmemcpy(bak, pak_path, dl);
-                swprintf(bak + dl, bl - dl, L"%ls.bak", orig_name);
-            } else {
-                bak = xmalloc((pl + 8) * sizeof(wchar_t));
-                swprintf(bak, pl + 8, L"%ls.bak", pak_path);
-            }
+        if (ours && !is_bak(pak_path)) {
+            wchar_t *bak = orig_name ? beside(pak_path, orig_name, L".bak") : beside(pak_path, file_part(pak_path), L".bak");
             free(orig_name);
             pak_entries_free(e, nf);
             pak_close(&a->mod);
-            if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES)
+            if (!file_exists(bak))
                 sr_fail("this pak was already patched by SuitPatcher, and its backup (%ls) is gone. Patch the "
                         "original download instead.", bak);
             log_msg("this pak was already patched: starting again from its backup");
-            analysis *b = analyze_pak(bak, game_paks);
+            // its add-ons too, unless others were chosen
+            const wchar_t *use[MAX_ADDONS];
+            wchar_t *found[MAX_ADDONS] = {0};
+            int nuse = 0;
+            if (naddons) for (int k = 0; k < naddons && k < MAX_ADDONS; k++) use[nuse++] = addons[k];
+            else
+                for (int k = 0; k < nprev; k++) {
+                    wchar_t *ab = beside(pak_path, prev[k], L".bak"), *al = beside(pak_path, prev[k], L"");
+                    if (file_exists(ab)) { found[k] = ab; free(al); }
+                    else if (file_exists(al)) { found[k] = al; free(ab); }
+                    else { log_msg("note: the add-on %ls (and its backup) is gone; patching without it", prev[k]); free(ab); free(al); }
+                    if (found[k]) use[nuse++] = found[k];
+                }
+            for (int k = 0; k < nprev; k++) free(prev[k]);
+            analysis *b = analyze_pak(bak, use, nuse, game_paks);
+            for (int k = 0; k < MAX_ADDONS; k++) free(found[k]);
             // a pak patched under another name (or in place, by version 1.0.0) goes once the new one is written
             if (_wcsicmp(pak_path, b->out_path)) b->stale_path = _wcsdup(pak_path);
             free(bak);
@@ -496,29 +572,75 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
             return b;
         }
         free(orig_name);
+        for (int k = 0; k < nprev; k++) free(prev[k]);
         if (!ours) {
             pak_entries_free(e, nf);
             sr_fail("this pak already has a SuitRegistry manifest (%s), so it works with the SuitRegistry as it is",
                     e[i].path);
         }
     }
-    size_t pl = wcslen(pak_path);
-    a->orig_path = _wcsdup(pak_path);
-    if (pl > 4 && !_wcsicmp(pak_path + pl - 4, L".bak")) a->orig_path[pl - 4] = 0;
+    a->orig_path = strip_bak(pak_path);
     a->out_path = patched_path(a->orig_path);
-    const wchar_t *fn = wcsrchr(a->orig_path, L'\\');
-    a->source_name = w_to_utf8(fn ? fn + 1 : a->orig_path);
+    a->source_name = w_to_utf8(file_part(a->orig_path));
 
-    // files and packages of the mod
+    // the mod's files, then the add-ons' (an add-on's file replaces the mod's file at the same path)
     ctx c = {a, {0}};
+    smap at = {0};                                              // pak path -> a->files index
     a->files = xcalloc(nf + 1, sizeof(mod_file));
+    for (int i = 0; i < nf; i++) {
+        a->files[i].path = e[i].path;
+        a->files[i].e = e[i];
+        smap_put(&at, e[i].path, i);
+    }
     a->nfiles = nf;
+    free(e);                                                    // (entries now owned by a->files)
+    if (naddons > MAX_ADDONS) naddons = MAX_ADDONS;
+    for (int k = 0; k < naddons; k++) {
+        wchar_t *orig = strip_bak(addons[k]);
+        if (!_wcsicmp(orig, a->orig_path)) sr_fail("add-on %d is the suit mod itself", k + 1);
+        for (int q = 0; q < k; q++)
+            if (!_wcsicmp(orig, a->addon_orig[q])) sr_fail("add-on %d is the same pak as add-on %d", k + 1, q + 1);
+        a->addon_path[k] = _wcsdup(addons[k]);
+        a->addon_orig[k] = orig;
+        a->addon_name[k] = w_to_utf8(file_part(orig));
+        a->naddons = k + 1;
+        log_msg("reading add-on %d: %ls", k + 1, addons[k]);
+        if (pak_open(&a->addon[k], addons[k], 1)) sr_fail("add-on %d is not a pak file Midnight Suns can read", k + 1);
+        int na, replaced = 0;
+        pak_entry *ae = pak_list(&a->addon[k], mod_dir_filter, NULL, &na);
+        for (int i = 0; i < na; i++)
+            if (!_strnicmp(ae[i].path, "CodaGame/SuitMods/", 18)) {
+                pak_entries_free(ae, na);
+                sr_fail("add-on %d (%s) has a SuitRegistry manifest: it is a suit of its own, not an add-on", k + 1,
+                        a->addon_name[k]);
+            }
+        a->files = xrealloc(a->files, sizeof(mod_file) * (a->nfiles + na + 1));
+        for (int i = 0; i < na; i++) {
+            int old = smap_get(&at, ae[i].path);
+            mod_file *f;
+            if (old >= 0) {
+                f = &a->files[old];
+                free(f->path); free(f->e.blocks);
+                replaced++;
+            } else {
+                f = &a->files[a->nfiles];
+                smap_put(&at, ae[i].path, a->nfiles++);
+            }
+            memset(f, 0, sizeof *f);
+            f->path = ae[i].path;
+            f->e = ae[i];
+            f->src = k + 1;
+        }
+        free(ae);
+        if (replaced) log_msg("  add-on %d replaces %d of the mod's files", k + 1, replaced);
+    }
+    smap_free(&at);
+
+    // packages
     char **dirs = NULL;
     int ndirs = 0, nregistry = 0;
-    for (int i = 0; i < nf; i++) {
+    for (int i = 0; i < a->nfiles; i++) {
         mod_file *f = &a->files[i];
-        f->path = e[i].path;
-        f->e = e[i];
         f->pkg = -1;
         const char *dot = strrchr(f->path, '.');
         if (dot && !strchr(dot, '/')) snprintf(f->ext, sizeof f->ext, "%s", dot);
@@ -542,6 +664,7 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
             memcpy(mp->prefix, f->path, ct - f->path + 9);
             mp->prefix[ct - f->path + 9] = 0;
             mp->fu = mp->fe = -1;
+            mp->src = f->src;
             m = a->npkgs++;
             smap_put(&c.mods, g, m);
             // its folder, in the game's spelling, for the index
@@ -554,10 +677,9 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
             else free(gp);
         } else free(g);
         f->pkg = m;
-        if (ends_with(f->path, ".uasset") || ends_with(f->path, ".umap")) a->pkgs[m].fu = i;
+        if (ends_with(f->path, ".uasset") || ends_with(f->path, ".umap")) { a->pkgs[m].fu = i; a->pkgs[m].src = f->src; }
         else if (ends_with(f->path, ".uexp")) a->pkgs[m].fe = i;
     }
-    free(e);                                                    // (entries now owned by a->files)
     if (nregistry) log_msg("the mod ships its own AssetRegistry (%d files): left out, the SuitRegistry replaces it", nregistry);
     if (!a->npkgs) sr_fail("this pak has no game packages (.uasset) in it");
 
@@ -570,14 +692,14 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
     log_msg("game: %ls", a->paks_dir);
     if (!oodle_load(1)) sr_fail("the Oodle library (needed to read the game's files) is not available");
     a->game = game_open(a->paks_dir, dirs, ndirs);
-    int noverride = 0;
+    int noverride = 0;                                          // the mod's own (add-ons not counted)
     for (int m = 0; m < a->npkgs; m++) {
         mod_pkg *mp = &a->pkgs[m];
         if (mp->fu < 0) continue;
         char *p = game_to_pak(mp->game, ".uasset");
         mp->override = game_has(a->game, p);
         free(p);
-        noverride += mp->override;
+        noverride += mp->override && !mp->src;
         upkg *u = load_pkg(&c, mp->game, 0, NULL);
         int me = upkg_main_export(u);
         mp->cls = xstrdup(me >= 0 ? upkg_class_of(u, me) : "");
@@ -594,7 +716,7 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
         memcpy(all, outfits.v, sizeof(char *) * outfits.n);
         memcpy(all + outfits.n, palettes.v, sizeof(char *) * palettes.n);
         log_msg("reading the game's registries...");
-        check_registered(a, all, n, ok);
+        check_registered(a, all, n, ok, 0);
         int k = 0, dropped = 0;
         for (int i = 0; i < outfits.n; i++) if (ok[i]) outfits.v[k++] = outfits.v[i]; else { free(outfits.v[i]); dropped++; }
         outfits.n = k;
@@ -607,7 +729,7 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
     // a new outfit in the mod: standalone mode
     int new_outfit = -1;
     for (int m = 0; m < a->npkgs; m++)
-        if (!a->pkgs[m].override && !strcmp(a->pkgs[m].cls, "CodaTacticalOutfitPieceTemplate")) {
+        if (!a->pkgs[m].override && !a->pkgs[m].src && !strcmp(a->pkgs[m].cls, "CodaTacticalOutfitPieceTemplate")) {
             if (new_outfit >= 0) { log_msg("note: the pak has more than one new suit; only %s is patched", a->pkgs[new_outfit].game); break; }
             new_outfit = m;
         }
@@ -641,16 +763,18 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
         if (!noverride) sr_fail("this pak doesn't change any of the game's files and has no new suit in it");
         a->mode = MODE_REPLACER;
         graph gr = {&c, {0}, NULL, 0, 0, 0, {0}, 0};
+        // the mod's changed files pick the suit; the add-ons' come along where the suit uses them
         int ns = 0;
-        for (int m = 0; m < a->npkgs; m++)
-            if (a->pkgs[m].override) smap_put(&gr.sidx, a->pkgs[m].game, ns++);
+        for (int pass = 0; pass < 2; pass++)
+            for (int m = 0; m < a->npkgs; m++)
+                if (a->pkgs[m].override && !a->pkgs[m].src == !pass) smap_put(&gr.sidx, a->pkgs[m].game, ns++);
         gr.words = (ns + 63) / 64;
-        log_msg("looking for the suit that uses the %d changed game files...", ns);
+        log_msg("looking for the suit that uses the %d changed game files...", noverride);
         int best = -1, best_n = 0;
         for (int i = 0; i < outfits.n; i++) {
             int id = node_of(&gr, outfits.v[i]);
             reach(&gr, id, 1);
-            int cnt = bits_count(&gr, gr.v[id].bits);
+            int cnt = bits_count_upto(gr.v[id].bits, noverride);
             if (!cnt) continue;
             // more changed files wins; then the base game over DLC, then the shorter name
             int better = cnt > best_n;
@@ -665,7 +789,7 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
         if (best < 0) sr_fail("none of the game's suits uses the files this mod changes, so there is no suit to copy");
         for (int i = 0; i < outfits.n; i++) {
             int id = smap_get(&gr.ids, outfits.v[i]);
-            if (i != best && id >= 0 && bits_count(&gr, gr.v[id].bits) == best_n)
+            if (i != best && id >= 0 && bits_count_upto(gr.v[id].bits, noverride) == best_n)
                 log_msg("note: %s uses the same files; using %s", upkg_short(outfits.v[i]), upkg_short(outfits.v[best]));
         }
         a->outfit = xstrdup(outfits.v[best]);
@@ -695,6 +819,61 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
             reach(&gr, id, 1);
             collect(&gr, id, &seen, &cl, &ncl);
         }
+        // a suit without a head or hair of its own wears the hero's default ones (HeadMesh / HairMesh of the battle
+        // look, TacticalPawnConfig: on the character template, or on its blueprint class when the template keeps the
+        // class default). When the mod or an add-on changes one of them, the new suit gets a copy as its own.
+        {
+            upkg *u = load_pkg(&c, a->outfit, 1, NULL);
+            int ue = upkg_main_export(u);
+            ptag t;
+            int own[NLOOKS];
+            for (int s = 0; s < NLOOKS; s++) own[s] = prop_find(u, ue, LOOK_PROP[s], &t);
+            int nr;
+            char **refs = upkg_refs(u, &nr), *chr = NULL;
+            upkg_free(u);
+            for (int i = 0; i < nr; i++) {
+                if (!chr && strstr(refs[i], "/Templates/Characters/Heroes/")) chr = refs[i];
+                else free(refs[i]);
+            }
+            free(refs);
+            upkg *cu = NULL, *bu = NULL;
+            jmp_buf j, *outer = sr_jmp;
+            sr_jmp = &j;
+            if (!setjmp(j) && chr) {
+                cu = load_pkg(&c, chr, 1, NULL);
+                // the template's class: <package>.<Name>_C among its references
+                const char *cls = cu ? upkg_class_of(cu, upkg_main_export(cu)) : "";
+                int cr;
+                char **crefs = cu ? upkg_refs(cu, &cr) : NULL;
+                for (int i = 0; crefs && i < cr; i++) {
+                    size_t sl = strlen(upkg_short(crefs[i]));
+                    if (!bu && !_strnicmp(cls, upkg_short(crefs[i]), sl) && !_stricmp(cls + sl, "_C"))
+                        bu = load_pkg(&c, crefs[i], 1, NULL);
+                    free(crefs[i]);
+                }
+                free(crefs);
+            }
+            sr_jmp = outer;
+            for (int s = 0; s < NLOOKS && cu; s++) {
+                if (own[s]) continue;
+                const char *hp = prop_find_softpath_deep(cu, LOOK_PROP[s], "TacticalPawnConfig");
+                if (!hp && bu) hp = prop_find_softpath_deep(bu, LOOK_PROP[s], "TacticalPawnConfig");
+                if (!hp) continue;
+                char *look = xstrdup(hp);
+                look[strcspn(look, ".")] = 0;
+                int id = node_of(&gr, look);
+                reach(&gr, id, 0);
+                if (bits_any(&gr, gr.v[id].bits)) {
+                    log_msg("the suit uses %s's default %s, which this mod changes: the new suit gets its own copy",
+                            upkg_short(chr), LOOK_WHAT[s]);
+                    collect(&gr, id, &seen, &cl, &ncl);
+                    a->look[s] = look;
+                } else free(look);
+            }
+            upkg_free(cu);
+            upkg_free(bu);
+            free(chr);
+        }
         smap_free(&seen);
         add_item(a, a->outfit, smap_get(&c.mods, a->outfit), K_OUTFIT, 1);
         for (int i = 0; i < npal; i++) add_item(a, pals[i], smap_get(&c.mods, pals[i]), K_PALETTE, 1);
@@ -710,7 +889,7 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
             char **paths = xmalloc(sizeof(char *) * (a->nitems + 1));
             int *ok = xcalloc(a->nitems + 1, sizeof(int));
             for (int i = 0; i < a->nitems; i++) paths[i] = a->items[i].game;
-            check_registered(a, paths, a->nitems, ok);
+            check_registered(a, paths, a->nitems, ok, 1);
             for (int i = 0; i < a->nitems; i++) a->items[i].unregistered = !ok[i];
             free(paths); free(ok);
         }
@@ -721,11 +900,22 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
                 if (!left++) log_msg("these changed files are not part of the suit and stay as they are (they still change the game's own files):");
                 log_msg("  %s", a->pkgs[m].game);
             }
+        for (int k = 0; k < a->naddons; k++) {
+            int used = 0, global = 0;
+            for (int m = 0; m < a->npkgs; m++)
+                if (a->pkgs[m].src == k + 1 && a->pkgs[m].override) { if (a->pkgs[m].in_clone) used++; else global++; }
+            log_msg("add-on %d (%s): %d changed file%s now belong%s to the new suit only%s", k + 1, a->addon_name[k], used,
+                    used == 1 ? "" : "s", used == 1 ? "s" : "", global ? "; the others still change the game's own files (listed above)" : "");
+        }
         for (int i = 0; i < gr.n; i++) { free(gr.v[i].path); free(gr.v[i].bits); free(gr.v[i].kids); }
         free(gr.v);
         smap_free(&gr.ids);
         smap_free(&gr.sidx);
     }
+    if (a->mode == MODE_STANDALONE)
+        for (int k = 0; k < a->naddons; k++)
+            log_msg("add-on %d (%s): included as it is (with a new suit, add-ons still change the game's own files)", k + 1,
+                    a->addon_name[k]);
     for (int i = 0; i < outfits.n; i++) free(outfits.v[i]);
     for (int i = 0; i < palettes.n; i++) free(palettes.v[i]);
     free(outfits.v); free(palettes.v);
@@ -761,6 +951,11 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
                  "This mod adds a new suit (%s, now called \"%s\") with %d palette%s. Patching registers it with the "
                  "SuitRegistry%s.", upkg_short(a->outfit), a->outfit_name ? a->outfit_name : "?", npal,
                  npal == 1 ? "" : "s", nregistry ? " and removes the mod's own AssetRegistry files" : "");
+    if (a->naddons) {
+        size_t sl = strlen(a->summary);
+        snprintf(a->summary + sl, sizeof a->summary - sl, " %d add-on%s merged in.", a->naddons,
+                 a->naddons == 1 ? "" : "s");
+    }
     log_msg("%s", a->summary);
     for (int i = 0; i < a->nitems; i++)
         log_msg("  %-8s %s%s", a->items[i].kind == K_OUTFIT ? "outfit" : a->items[i].kind == K_PALETTE ? "palette" : "file",
@@ -780,9 +975,14 @@ void analysis_free(analysis *a)
     free(a->items);
     for (int i = 0; i < a->npal; i++) { free(a->pal[i].pkg); free(a->pal[i].old_name); }
     if (a->mod.h) pak_close(&a->mod);
+    for (int k = 0; k < a->naddons; k++) {
+        if (a->addon[k].h) pak_close(&a->addon[k]);
+        free(a->addon_path[k]); free(a->addon_orig[k]); free(a->addon_name[k]);
+    }
     game_close(a->game);
     free(a->pak_path); free(a->orig_path); free(a->out_path); free(a->stale_path); free(a->paks_dir);
     free(a->outfit); free(a->outfit_name); free(a->source_name);
+    for (int s = 0; s < NLOOKS; s++) free(a->look[s]);
     free(a);
 }
 
@@ -1058,6 +1258,22 @@ patch_result run_patch(analysis *a, const patch_options *o)
             const char *display = o->name;
             for (int q = 0; q < npal_items; q++) if (!_stricmp(pal_pkg[q], it->game)) display = pal_name[q];
             apply_item_edits(u, it, tag, display, o->rarity, new_outfit_obj, np);
+            for (int s = 0; s < NLOOKS && it->kind == K_OUTFIT; s++) {
+                if (!a->look[s]) continue;
+                char *lop = obj_path(rmap_get(&m, a->look[s]));
+                prop_set_softpath(u, upkg_main_export(u), LOOK_PROP[s], lop);
+                free(lop);
+            }
+        } else {
+            // other items the suit brings (e.g. the weapon it equips): their own ID, free like the suit
+            int e = upkg_main_export(u);
+            ptag t;
+            if (e >= 0 && prop_find(u, e, "EntitlementID", &t)) {
+                uint8_t d[20];
+                hex_digest(tag, np, "EntitlementID", d);
+                prop_set_guid(u, e, "EntitlementID", d);
+                prop_set_bool(u, e, "bRequirePurchase", 0);
+            }
         }
         const char *prefix = from_mod >= 0 ? a->pkgs[from_mod].prefix : "CodaGame/Content/";
         char *base = pak_base(prefix, np);
@@ -1111,6 +1327,14 @@ patch_result run_patch(analysis *a, const patch_options *o)
     json_str(&mj, a->source_name);
     buf_put(&mj, ", \"base\": ", 10);
     json_str(&mj, a->mode == MODE_REPLACER ? a->outfit : "");
+    if (a->naddons) {
+        buf_put(&mj, ", \"addons\": [", 13);
+        for (int k = 0; k < a->naddons; k++) {
+            if (k) buf_put(&mj, ", ", 2);
+            json_str(&mj, a->addon_name[k]);
+        }
+        buf_put(&mj, "]", 1);
+    }
     buf_put(&mj, "},\n \"note\": ", 12);
     json_str(&mj, "Made by SuitPatcher. Read by the Midnight Suns SuitRegistry (version.dll): each source is a game "
                   "registry entry cloned under the new name of one package of this suit.");
@@ -1123,37 +1347,47 @@ patch_result run_patch(analysis *a, const patch_options *o)
     pak_write_end(w);
     sr_jmp = outer;
 
-    // swap it in: the original becomes <name>.pak.bak (unless we read from that backup already), and the patched pak
-    // is <name>_patched.pak
+    // swap it in: the original (and each add-on) becomes <name>.pak.bak, unless we read from that backup already, and
+    // the patched pak is <name>_patched.pak. Every rename is undone if a later one fails.
     pak_close(&a->mod);
-    size_t gl = wcslen(a->orig_path);
-    wchar_t *bak = xmalloc((gl + 8) * sizeof(wchar_t));
-    swprintf(bak, gl + 8, L"%ls.bak", a->orig_path);
-    int from_backup = _wcsicmp(a->pak_path, a->orig_path) != 0;
-    if (!from_backup) {
-        if (!MoveFileExW(a->orig_path, bak, MOVEFILE_REPLACE_EXISTING)) {
-            DWORD err = GetLastError();
-            DeleteFileW(tmp);
-            sr_fail(err == ERROR_SHARING_VIOLATION || err == ERROR_ACCESS_DENIED
-                        ? "the pak is in use or read-only (is the game running?)"
-                        : "could not rename the original pak (error %lu)", err);
-        }
-        res.backup_path = bak;
-    } else {
-        res.backup_path = _wcsdup(a->pak_path);
-        free(bak);
+    for (int k = 0; k < a->naddons; k++) pak_close(&a->addon[k]);
+    const wchar_t *src[1 + MAX_ADDONS], *orig[1 + MAX_ADDONS];
+    wchar_t *bak[1 + MAX_ADDONS];
+    int moved[1 + MAX_ADDONS] = {0}, nsrc = 1 + a->naddons;
+    src[0] = a->pak_path; orig[0] = a->orig_path;
+    for (int k = 0; k < a->naddons; k++) { src[k + 1] = a->addon_path[k]; orig[k + 1] = a->addon_orig[k]; }
+    for (int k = 0; k < nsrc; k++) {
+        size_t gl = wcslen(orig[k]);
+        bak[k] = xmalloc((gl + 8) * sizeof(wchar_t));
+        swprintf(bak[k], gl + 8, L"%ls.bak", orig[k]);
     }
+    for (int k = nsrc - 1; k >= 0; k--) {
+        if (_wcsicmp(src[k], orig[k])) continue;                 // read from the backup already
+        if (!MoveFileExW(orig[k], bak[k], MOVEFILE_REPLACE_EXISTING)) {
+            DWORD err = GetLastError();
+            for (int q = k + 1; q < nsrc; q++) if (moved[q]) MoveFileExW(bak[q], orig[q], 0);
+            DeleteFileW(tmp);
+            const wchar_t *fn = file_part(orig[k]);
+            sr_fail(err == ERROR_SHARING_VIOLATION || err == ERROR_ACCESS_DENIED
+                        ? "%ls is in use or read-only (is the game running?)"
+                        : "could not rename %ls (error %lu)", fn, err);
+        }
+        moved[k] = 1;
+    }
+    res.backup_path = _wcsdup(bak[0]);
     if (!MoveFileExW(tmp, a->out_path, MOVEFILE_REPLACE_EXISTING)) {
         DWORD err = GetLastError();
+        for (int q = 0; q < nsrc; q++) if (moved[q]) MoveFileExW(bak[q], orig[q], 0);
         sr_fail("could not write %ls (error %lu); the patched pak is %ls", a->out_path, err, tmp);
     }
-    // nothing else may load the mod a second time: a pak under the original's name (when patching from the backup;
-    // earlier versions patched in place) or an earlier patched pak under another name
-    if (from_backup && GetFileAttributesW(a->orig_path) != INVALID_FILE_ATTRIBUTES) {
-        if (DeleteFileW(a->orig_path)) log_msg("removed %ls (the backup is the original)", a->orig_path);
+    // nothing else may load the mod or an add-on a second time: a pak under the original's name (when patching from
+    // the backup; earlier versions patched in place) or an earlier patched pak under another name
+    for (int k = 0; k < nsrc; k++) {
+        if (moved[k] || !file_exists(orig[k])) continue;
+        if (DeleteFileW(orig[k])) log_msg("removed %ls (the backup is the original)", orig[k]);
         else {
             DWORD err = GetLastError();
-            log_msg("could not remove %ls (error %lu): delete it, or the mod loads twice", a->orig_path, err);
+            log_msg("could not remove %ls (error %lu): delete it, or it loads twice", orig[k], err);
         }
     }
     if (a->stale_path && _wcsicmp(a->stale_path, a->orig_path)) {
@@ -1166,12 +1400,19 @@ patch_result run_patch(analysis *a, const patch_options *o)
     }
     free(a->stale_path);
     a->stale_path = NULL;
-    // reopen the source so the same analysis can patch again (with other names)
-    pak_open(&a->mod, res.backup_path, 1);
-    if (_wcsicmp(a->pak_path, res.backup_path)) { free(a->pak_path); a->pak_path = _wcsdup(res.backup_path); }
+    // reopen the sources (now the backups) so the same analysis can patch again (with other names)
+    pak_open(&a->mod, bak[0], 1);
+    free(a->pak_path);
+    a->pak_path = bak[0];
+    for (int k = 0; k < a->naddons; k++) {
+        pak_open(&a->addon[k], bak[k + 1], 1);
+        free(a->addon_path[k]);
+        a->addon_path[k] = bak[k + 1];
+    }
     res.out_path = a->out_path;
     res.nfiles = nout;
-    log_msg("done: %ls (%d files); original kept as %ls", a->out_path, nout, res.backup_path);
+    log_msg("done: %ls (%d files); original kept as %ls%ls", a->out_path, nout, res.backup_path,
+            a->naddons ? L" (and the add-ons as .bak files too)" : L"");
     for (int i = 0; i < npal_items; i++) free(pal_name[i]);
     free(pal_name); free(pal_pkg); free(tmp); free(new_outfit_obj);
     for (int i = 0; i < m.n; i++) { free(m.from[i]); free(m.to[i]); }

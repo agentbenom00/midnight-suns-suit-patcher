@@ -65,6 +65,9 @@ typedef struct {
 } ptag;
 
 int prop_find(upkg *p, int exp, const char *name, ptag *t);     // 1 if found
+// value of the first SoftObjectProperty `name` in any export, also inside structs (only inside a struct property called
+// `within`, unless NULL); NULL if none (pointer into the name map)
+const char *prop_find_softpath_deep(upkg *p, const char *name, const char *within);
 void prop_set_bool(upkg *p, int exp, const char *name, int v);
 void prop_set_text(upkg *p, int exp, const char *name, const char *key, const char *utf8);
 char *prop_get_text(upkg *p, int exp, const char *name);        // source string, malloc'd, NULL if none

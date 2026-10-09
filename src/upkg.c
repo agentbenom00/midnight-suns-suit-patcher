@@ -386,8 +386,23 @@ static char *object_path(const char *pkg)
     return o;
 }
 
+// the object names a package's own objects go by: <X>, and for a blueprint <X>_C and Default__<X>_C. If `name` is
+// one of them for package short name `old`, *out gets the same one for `new_` (1 returned).
+static int own_name(const char *name, const char *old, const char *new_, char *out, size_t n)
+{
+    size_t ol = strlen(old);
+    if (!_stricmp(name, old)) { snprintf(out, n, "%s", new_); return 1; }
+    if (!_strnicmp(name, old, ol) && !_stricmp(name + ol, "_C")) { snprintf(out, n, "%s_C", new_); return 1; }
+    if (!_strnicmp(name, "Default__", 9) && !_strnicmp(name + 9, old, ol) && !_stricmp(name + 9 + ol, "_C")) {
+        snprintf(out, n, "Default__%s_C", new_);
+        return 1;
+    }
+    return 0;
+}
+
 void upkg_rename(upkg *p, const rename_map *m, const char *self_old, const char *self_new)
 {
+    char nn[512];
     // object imports inside a renamed package import: they take the new short name (looked up before the package
     // import's own name changes below)
     for (int i = 0; i < p->nimp; i++) {
@@ -398,14 +413,15 @@ void upkg_rename(upkg *p, const rename_map *m, const char *self_old, const char 
         const char *to = rmap_get(m, upkg_name_at(p, pk->name));
         if (!to) continue;
         const char *from = upkg_name_at(p, pk->name);
-        if (!_stricmp(upkg_name_at(p, p->imp[i].name), upkg_short(from)))
-            p->imp[i].name = upkg_name(p, upkg_short(to));
+        if (own_name(upkg_name_at(p, p->imp[i].name), upkg_short(from), upkg_short(to), nn, sizeof nn))
+            p->imp[i].name = upkg_name(p, nn);
     }
     // the package's own asset export (and other top-level exports with its name)
     if (self_old && self_new) {
         for (int i = 0; i < p->nexp; i++)
-            if (p->exp[i].outer == 0 && p->exp[i].name >= 0 && !_stricmp(upkg_name_at(p, p->exp[i].name), upkg_short(self_old)))
-                p->exp[i].name = upkg_name(p, upkg_short(self_new));
+            if (p->exp[i].outer == 0 && p->exp[i].name >= 0 &&
+                own_name(upkg_name_at(p, p->exp[i].name), upkg_short(self_old), upkg_short(self_new), nn, sizeof nn))
+                p->exp[i].name = upkg_name(p, nn);
     }
     // full paths: "/Game/A/X" (package imports, soft package references) and "/Game/A/X.X" (soft object paths),
     // also "/Game/A/X.X:Sub" style subobject paths
@@ -423,10 +439,14 @@ void upkg_rename(upkg *p, const rename_map *m, const char *self_old, const char 
             if (*rest == '.') {
                 const char *obj = rest + 1;
                 size_t ol = strcspn(obj, ":.");
-                if (ol == strlen(upkg_short(pkg)) && !_strnicmp(obj, upkg_short(pkg), ol)) {
-                    buf_u8(&b, '.');
-                    buf_put(&b, upkg_short(to), strlen(upkg_short(to)));
-                    rest = obj + ol;
+                char on[512];
+                if (ol < sizeof on) {
+                    memcpy(on, obj, ol); on[ol] = 0;
+                    if (own_name(on, upkg_short(pkg), upkg_short(to), nn, sizeof nn)) {
+                        buf_u8(&b, '.');
+                        buf_put(&b, nn, strlen(nn));
+                        rest = obj + ol;
+                    }
                 }
             }
             buf_put(&b, rest, strlen(rest) + 1);
@@ -468,6 +488,17 @@ static const char *fname_at(upkg *p, const uint8_t *q)
 
 static size_t exp_start(upkg *p, int e) { return (size_t)(p->exp[e].off - p->total); }
 
+// structs serialized natively (no tags inside)
+static int is_native_struct(const char *s)
+{
+    static const char *n[] = {"Vector", "Vector2D", "Vector4", "Rotator", "Quat", "Guid", "LinearColor", "Color",
+                              "SoftObjectPath", "SoftClassPath", "IntPoint", "IntVector", "Box", "Box2D", "DateTime",
+                              "Timespan", "GameplayTagContainer", "GameplayTag", "FrameNumber", "PerPlatformFloat",
+                              "PerPlatformInt", "Plane", "Matrix", "SoftObjectPtr", NULL};
+    for (int i = 0; n[i]; i++) if (!strcmp(s, n[i])) return 1;
+    return 0;
+}
+
 // read the tag at *at; 0 at "None" (then *at is past it)
 static int tag_read(upkg *p, int e, size_t *at, ptag *t)
 {
@@ -503,6 +534,35 @@ static int tag_read(upkg *p, int e, size_t *at, ptag *t)
     rd_skip(&r, (size_t)t->size);
     *at = r.at;
     return 1;
+}
+
+// first SoftObjectProperty `name` in [at, None) of export e, looking inside structs too (only inside a struct property
+// called `within` unless that is NULL)
+static const char *softpath_in(upkg *p, int e, size_t at, const char *name, const char *within, int inside, int depth)
+{
+    ptag t;
+    while (tag_read(p, e, &at, &t)) {
+        if ((inside || !within) && !strcmp(t.name, name) && !strcmp(t.type, "SoftObjectProperty") && t.size >= 8)
+            return upkg_name_at(p, (int32_t)rd32(p->ue + t.val));
+        if (depth < 6 && !strcmp(t.type, "StructProperty") && t.sub && !is_native_struct(t.sub)) {
+            const char *r = softpath_in(p, e, t.val, name, within, inside || (within && !strcmp(t.name, within)), depth + 1);
+            if (r) return r;
+        }
+    }
+    return NULL;
+}
+
+const char *prop_find_softpath_deep(upkg *p, const char *name, const char *within)
+{
+    for (int e = 0; e < p->nexp; e++) {
+        const char *r = NULL;
+        jmp_buf j, *outer = sr_jmp;                             // a struct we can't walk: skip that export
+        sr_jmp = &j;
+        if (!setjmp(j)) r = softpath_in(p, e, exp_start(p, e), name, within, 0, 0);
+        sr_jmp = outer;
+        if (r && strcmp(r, "None")) return r;
+    }
+    return NULL;
 }
 
 int prop_find(upkg *p, int e, const char *name, ptag *t)

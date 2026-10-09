@@ -1,4 +1,5 @@
-// The window: Browse to a suit mod pak, type a name, pick a rarity, optionally name the palettes, Patch.
+// The window: Browse to a suit mod pak, type a name, pick a rarity, optionally name the palettes and add add-on paks,
+// Patch.
 // Plain Win32 (works the same on Windows and under Wine/Proton). Reading and patching run on a worker thread.
 #include "patcher.h"
 #include <commctrl.h>
@@ -10,7 +11,8 @@ HINSTANCE sr_self;
 
 enum {
     ID_PATH = 100, ID_BROWSE, ID_SUMMARY, ID_NAME, ID_RARITY, ID_PATCH, ID_LOG, ID_PALGROUP, ID_PALHINT,
-    ID_PAL = 200, ID_SWATCH = 300, ID_PALLABEL = 400,
+    ID_PAL = 200, ID_SWATCH = 300, ID_PALLABEL = 400, ID_ADDON = 500, ID_ADDON_BROWSE = 510, ID_ADDON_CLEAR = 520,
+    ID_ADDONGROUP = 530,
 };
 #define WM_LOGLINE (WM_APP + 1)
 #define WM_ANALYZED (WM_APP + 2)
@@ -21,10 +23,13 @@ static const int RARITY_VALUE[4] = {3, 2, 1, 0};
 
 static HWND wnd, h_path, h_browse, h_summary, h_name, h_rarity, h_patch, h_log, h_palgroup, h_palhint;
 static HWND h_pal[MAX_PALETTES], h_swatch[MAX_PALETTES], h_pallabel[MAX_PALETTES];
+static HWND h_addon[MAX_ADDONS], h_addon_browse[MAX_ADDONS], h_addon_clear[MAX_ADDONS];
 static HFONT font, font_title, font_small;
 static analysis *cur;                                           // the analysed pak (GUI thread owns it when idle)
 static volatile LONG busy;
 static wchar_t *pending_path;
+static wchar_t *main_src;                                       // the mod pak to read (its backup once patched)
+static wchar_t *addon_sel[MAX_ADDONS];                          // chosen add-on paks (NULL = empty slot)
 static double scale = 1.0;
 
 static int S(int v) { return (int)(v * scale + 0.5); }
@@ -70,6 +75,25 @@ static void update_buttons(void)
     free(name);
     EnableWindow(h_patch, ok);
     EnableWindow(h_browse, !busy);
+    for (int i = 0; i < MAX_ADDONS; i++) {
+        EnableWindow(h_addon_browse[i], !busy && main_src);
+        EnableWindow(h_addon_clear[i], !busy && addon_sel[i]);
+    }
+}
+
+static void show_addons(void)
+{
+    for (int i = 0; i < MAX_ADDONS; i++) SetWindowTextW(h_addon[i], addon_sel[i] ? addon_sel[i] : L"");
+}
+
+// the add-ons the analysis really read (backups once patched), in their slots
+static void take_addons(const analysis *a)
+{
+    for (int i = 0; i < MAX_ADDONS; i++) { free(addon_sel[i]); addon_sel[i] = NULL; }
+    for (int i = 0; i < a->naddons; i++) addon_sel[i] = _wcsdup(a->addon_path[i]);
+    free(main_src);
+    main_src = _wcsdup(a->pak_path);
+    show_addons();
 }
 
 static void set_summary(const char *s)
@@ -90,9 +114,8 @@ static void show_palettes(void)
         if (!show) continue;
         SetWindowTextW(h_pal[i], L"");
         wchar_t cue[160];
-        swprintf(cue, 160, L"%hs  (automatic)", cur->pal[i].auto_name);
         wchar_t *wc = utf8_to_w(cur->pal[i].auto_name);
-        swprintf(cue, 160, L"%ls  (automatic)", wc);
+        swprintf(cue, 160, L"%ls (auto)", wc);
         free(wc);
         SendMessageW(h_pal[i], EM_SETCUEBANNER, TRUE, (LPARAM)cue);
         InvalidateRect(h_swatch[i], NULL, TRUE);
@@ -105,7 +128,7 @@ static void show_palettes(void)
 
 // ---------------------------------------------------------------- worker
 
-typedef struct { wchar_t *pak, *game; } analyze_job;
+typedef struct { wchar_t *pak, *game, *addons[MAX_ADDONS]; int naddons; } analyze_job;
 
 static DWORD WINAPI analyze_thread(LPVOID p)
 {
@@ -113,10 +136,12 @@ static DWORD WINAPI analyze_thread(LPVOID p)
     analysis *volatile a = NULL;
     jmp_buf jb;
     sr_jmp = &jb;
-    if (!setjmp(jb)) a = analyze_pak(j->pak, j->game);
+    if (!setjmp(jb)) a = analyze_pak(j->pak, (const wchar_t *const *)j->addons, j->naddons, j->game);
     else { log_msg("error: %s", sr_error); a = NULL; }
     sr_jmp = NULL;
-    free(j->pak); free(j->game); free(j);
+    free(j->pak); free(j->game);
+    for (int i = 0; i < j->naddons; i++) free(j->addons[i]);
+    free(j);
     PostMessageW(wnd, WM_ANALYZED, patcher_need_game, (LPARAM)a);
     return 0;
 }
@@ -133,8 +158,10 @@ static void start_analysis(const wchar_t *pak, const wchar_t *game)
     analyze_job *j = xcalloc(1, sizeof *j);
     j->pak = _wcsdup(pak);
     j->game = game ? _wcsdup(game) : NULL;
+    for (int i = 0; i < MAX_ADDONS; i++) if (addon_sel[i]) j->addons[j->naddons++] = _wcsdup(addon_sel[i]);
     free(pending_path);
     pending_path = _wcsdup(pak);
+    if (pak != main_src) { free(main_src); main_src = _wcsdup(pak); }
     HANDLE t = CreateThread(NULL, 4 << 20, analyze_thread, j, 0, NULL);
     if (t) CloseHandle(t);
 }
@@ -177,6 +204,15 @@ static void start_patch(void)
 
 // ---------------------------------------------------------------- dialogs
 
+// another suit mod: its add-ons start empty (a pak patched before brings back its own)
+static void new_mod(const wchar_t *file)
+{
+    if (busy) return;
+    for (int i = 0; i < MAX_ADDONS; i++) { free(addon_sel[i]); addon_sel[i] = NULL; }
+    show_addons();
+    start_analysis(file, NULL);
+}
+
 static void browse(void)
 {
     wchar_t file[MAX_PATH * 4] = L"";
@@ -189,8 +225,42 @@ static void browse(void)
     ofn.lpstrInitialDir = init;
     ofn.lpstrTitle = L"Choose the suit mod's .pak file";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER;
-    if (GetOpenFileNameW(&ofn)) start_analysis(file, NULL);
+    if (GetOpenFileNameW(&ofn)) new_mod(file);
     free(init);
+}
+
+static void browse_addon(int slot)
+{
+    wchar_t file[MAX_PATH * 4] = L"";
+    wchar_t *init = cur ? _wcsdup(cur->paks_dir) : game_find_paks(NULL);
+    OPENFILENAMEW ofn = {sizeof ofn};
+    ofn.hwndOwner = wnd;
+    ofn.lpstrFilter = L"Add-on paks (*.pak)\0*.pak\0Backups (*.pak.bak)\0*.pak.bak\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH * 4;
+    ofn.lpstrInitialDir = init;
+    ofn.lpstrTitle = L"Choose an add-on .pak for this suit (hair, weapon, ...)";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER;
+    if (GetOpenFileNameW(&ofn) && main_src) {
+        free(addon_sel[slot]);
+        addon_sel[slot] = _wcsdup(file);
+        show_addons();
+        wchar_t *m = _wcsdup(main_src);
+        start_analysis(m, NULL);
+        free(m);
+    }
+    free(init);
+}
+
+static void clear_addon(int slot)
+{
+    if (busy || !addon_sel[slot] || !main_src) return;
+    free(addon_sel[slot]);
+    addon_sel[slot] = NULL;
+    show_addons();
+    wchar_t *m = _wcsdup(main_src);
+    start_analysis(m, NULL);
+    free(m);
 }
 
 static wchar_t *ask_game_folder(void)
@@ -307,25 +377,40 @@ static void create_controls(void)
     }
     SendMessageW(h_rarity, CB_SETCUEBANNER, 0, (LPARAM)L"Choose...");
 
-    h_palgroup = make(L"BUTTON", L"Alt palette names (optional)", BS_GROUPBOX, L, 236, W, 252, ID_PALGROUP, 0);
+    h_palgroup = make(L"BUTTON", L"Alt palette names (optional)", BS_GROUPBOX, L, 236, W, 205, ID_PALGROUP, 0);
     h_palhint = make(L"STATIC", L"", 0, L + 12, 256, W - 24, 18, ID_PALHINT, 0);
     SendMessageW(h_palhint, WM_SETFONT, (WPARAM)font_small, FALSE);
     for (int i = 0; i < MAX_PALETTES; i++) {
-        int col = i / 8, row = i % 8;
-        int x = L + 12 + col * 298, y = 278 + row * 26;
+        int col = i / 6, row = i % 6;
+        int x = L + 12 + col * 196, y = 278 + row * 26;
         wchar_t num[8];
         swprintf(num, 8, L"%d.", i + 1);
         h_pallabel[i] = make(L"STATIC", num, SS_RIGHT, x, y + 3, 22, 18, ID_PALLABEL + i, 0);
-        h_swatch[i] = make(L"STATIC", L"", SS_OWNERDRAW, x + 28, y + 3, 18, 18, ID_SWATCH + i, 0);
-        h_pal[i] = make(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, x + 52, y, 230, 23, ID_PAL + i, WS_EX_CLIENTEDGE);
+        h_swatch[i] = make(L"STATIC", L"", SS_OWNERDRAW, x + 26, y + 3, 18, 18, ID_SWATCH + i, 0);
+        h_pal[i] = make(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, x + 48, y, 140, 23, ID_PAL + i, WS_EX_CLIENTEDGE);
         SendMessageW(h_pal[i], EM_SETLIMITTEXT, 40, 0);
         ShowWindow(h_pal[i], SW_HIDE); ShowWindow(h_swatch[i], SW_HIDE); ShowWindow(h_pallabel[i], SW_HIDE);
     }
 
-    h_patch = make(L"BUTTON", L"Patch", BS_DEFPUSHBUTTON | WS_TABSTOP, L + W - 140, 498, 140, 32, ID_PATCH, 0);
-    HWND need = make(L"STATIC", L"Needs a .pak, a name and a rarity.", 0, L, 506, W - 160, 18, 0, 0);
+    make(L"BUTTON", L"Add-ons (optional): extra paks for this suit, like hair or a weapon", BS_GROUPBOX, L, 449, W, 112,
+         ID_ADDONGROUP, 0);
+    for (int i = 0; i < MAX_ADDONS; i++) {
+        int y = 471 + i * 28;
+        wchar_t num[8];
+        swprintf(num, 8, L"%d.", i + 1);
+        make(L"STATIC", num, SS_RIGHT, L + 12, y + 3, 22, 18, 0, 0);
+        h_addon[i] = make(L"EDIT", L"", ES_AUTOHSCROLL | ES_READONLY, L + 40, y, W - 218, 24, ID_ADDON + i, WS_EX_CLIENTEDGE);
+        SendMessageW(h_addon[i], EM_SETCUEBANNER, TRUE, (LPARAM)L"No add-on");
+        h_addon_browse[i] = make(L"BUTTON", L"Browse...", BS_PUSHBUTTON | WS_TABSTOP, L + W - 172, y - 1, 90, 26,
+                                 ID_ADDON_BROWSE + i, 0);
+        h_addon_clear[i] = make(L"BUTTON", L"Remove", BS_PUSHBUTTON | WS_TABSTOP, L + W - 76, y - 1, 64, 26,
+                                ID_ADDON_CLEAR + i, 0);
+    }
+
+    h_patch = make(L"BUTTON", L"Patch", BS_DEFPUSHBUTTON | WS_TABSTOP, L + W - 140, 571, 140, 32, ID_PATCH, 0);
+    HWND need = make(L"STATIC", L"Needs a .pak, a name and a rarity.", 0, L, 579, W - 160, 18, 0, 0);
     SendMessageW(need, WM_SETFONT, (WPARAM)font_small, FALSE);
-    h_log = make(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, L, 540, W, 118, ID_LOG, WS_EX_CLIENTEDGE);
+    h_log = make(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, L, 613, W, 88, ID_LOG, WS_EX_CLIENTEDGE);
     SendMessageW(h_log, WM_SETFONT, (WPARAM)font_small, FALSE);
     show_palettes();
     update_buttons();
@@ -342,13 +427,15 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND: {
         int id = LOWORD(wp), code = HIWORD(wp);
         if (id == ID_BROWSE && code == BN_CLICKED) browse();
+        else if (id >= ID_ADDON_BROWSE && id < ID_ADDON_BROWSE + MAX_ADDONS && code == BN_CLICKED) browse_addon(id - ID_ADDON_BROWSE);
+        else if (id >= ID_ADDON_CLEAR && id < ID_ADDON_CLEAR + MAX_ADDONS && code == BN_CLICKED) clear_addon(id - ID_ADDON_CLEAR);
         else if (id == ID_PATCH && code == BN_CLICKED) start_patch();
         else if ((id == ID_NAME && code == EN_CHANGE) || (id == ID_RARITY && code == CBN_SELCHANGE)) update_buttons();
         return 0;
     }
     case WM_DROPFILES: {
         wchar_t file[MAX_PATH * 4];
-        if (DragQueryFileW((HDROP)wp, 0, file, MAX_PATH * 4)) start_analysis(file, NULL);
+        if (DragQueryFileW((HDROP)wp, 0, file, MAX_PATH * 4)) new_mod(file);
         DragFinish((HDROP)wp);
         return 0;
     }
@@ -373,6 +460,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         InterlockedExchange(&busy, 0);
         cur = (analysis *)lp;
         if (cur) {
+            take_addons(cur);
             set_summary(cur->summary);
             show_palettes();
             if (!GetWindowTextLengthW(h_name)) SetFocus(h_name);
@@ -394,12 +482,14 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         update_buttons();
         if (wp) {
             patch_result *r = (patch_result *)lp;
+            take_addons(cur);
             wchar_t msg[2048];
             const wchar_t *fn = wcsrchr(r->out_path, L'\\');
             const wchar_t *bn = wcsrchr(r->backup_path, L'\\');
-            swprintf(msg, 2048, L"Done! %ls is now a suit of its own.\n\nThe original mod is kept as %ls (the game ignores "
+            swprintf(msg, 2048, L"Done! %ls is now a suit of its own.\n\nThe original mod is kept as %ls%ls (the game ignores "
                                 L"it).\n\nStart the game: the SuitRegistry registers the new suit by itself.%ls",
                      fn ? fn + 1 : r->out_path, bn ? bn + 1 : r->backup_path,
+                     cur->naddons ? L", and the add-ons as .bak files too" : L"",
                      registry_installed(cur->paks_dir) ? L""
                      : L"\n\nNote: the SuitRegistry (version.dll) doesn't seem to be installed in this game. Install it, "
                        L"or the new suit won't show up.");
@@ -461,7 +551,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rc = {0, 0, S(640), S(674)};
+    RECT rc = {0, 0, S(640), S(715)};
     AdjustWindowRect(&rc, style, FALSE);
     HWND h = CreateWindowExW(0, wc.lpszClassName, L"Midnight Suns Suit Patcher", style, CW_USEDEFAULT, CW_USEDEFAULT,
                              rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, inst, NULL);
@@ -473,7 +563,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         wchar_t *p = _wcsdup(cmd);
         size_t n = wcslen(p);
         if (p[0] == L'"') { memmove(p, p + 1, n * sizeof(wchar_t)); n--; if (n && p[n - 1] == L'"') p[--n] = 0; }
-        if (*p) start_analysis(p, NULL);
+        if (*p) new_mod(p);
         free(p);
     }
     MSG m;

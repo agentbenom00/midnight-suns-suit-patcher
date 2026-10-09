@@ -3,7 +3,9 @@
 #include "upkg.h"
 
 #define MAX_PALETTES 16
-#define PATCHER_VERSION "1.1.0"
+#define NLOOKS 2                                                // head, hair
+#define MAX_ADDONS 3                                            // add-on paks (hair, weapon, ...) merged into the suit
+#define PATCHER_VERSION "1.2.0"
 
 // ---- game files (game.c)
 typedef struct gindex gindex;
@@ -14,6 +16,7 @@ void game_remember_paks(const wchar_t *paks);
 int game_paks_valid(const wchar_t *paks);
 // index of the game's own paks: suit-related folders plus `extra_dirs` (pak paths like "CodaGame/Content/X/")
 gindex *game_open(const wchar_t *paks, char **extra_dirs, int nextra);
+extern int game_index_everything;                               // test tool: index every folder
 void game_close(gindex *g);
 int game_has(gindex *g, const char *path);                      // pak path, e.g. CodaGame/Content/A/B.uasset
 uint8_t *game_read(gindex *g, const char *path, size_t *n);     // NULL if absent
@@ -51,6 +54,10 @@ typedef struct {
     wchar_t *orig_path;                                         // the original's own name (it becomes <name>.bak)
     wchar_t *out_path;                                          // where the patched pak is written (<name>_patched)
     wchar_t *stale_path;                                        // an earlier patched pak to remove (or NULL)
+    int naddons;
+    wchar_t *addon_path[MAX_ADDONS];                            // the add-on paks that are read (the originals)
+    wchar_t *addon_orig[MAX_ADDONS];                            // their own names (they become <name>.bak)
+    char *addon_name[MAX_ADDONS];                               // their file names, for the manifest
     wchar_t *paks_dir;                                          // the game's Paks folder
     char summary[1024];                                         // for the window
     char hero[16];                                              // e.g. MAGK
@@ -61,9 +68,11 @@ typedef struct {
     mod_file *files; int nfiles;
     mod_pkg *pkgs; int npkgs;
     char *source_name;                                          // file name of the original pak
+    char *look[NLOOKS];                                         // the hero's default head / hair, cloned as the suit's own
     clone_item *items; int nitems;
     gindex *game;
     pak mod;
+    pak addon[MAX_ADDONS];
 } analysis;
 
 typedef struct {
@@ -74,8 +83,11 @@ typedef struct {
 
 typedef struct { wchar_t *out_path; wchar_t *backup_path; char id[96]; int nfiles; } patch_result;
 
-// both fail via sr_fail (run them inside a sr_jmp handler)
-analysis *analyze_pak(const wchar_t *pak, const wchar_t *game_paks);   // game_paks NULL = find it
+// both fail via sr_fail (run them inside a sr_jmp handler). Add-on paks are merged into the suit: their files win
+// over the mod's, and those the suit uses are copied with it. A pak patched before brings back its own add-ons when
+// none are given.
+analysis *analyze_pak(const wchar_t *pak, const wchar_t *const *addons, int naddons,
+                      const wchar_t *game_paks);                // game_paks NULL = find it
 patch_result run_patch(analysis *a, const patch_options *o);
 void analysis_free(analysis *a);
 

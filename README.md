@@ -17,14 +17,17 @@ Get `SuitPatcher.exe` from the [latest release](../../releases/latest). The game
 3. Type a **name** for the suit and choose a **rarity** (Legendary, Epic, Rare or Common).
 4. Optionally name the **alt palettes**. Leave a box empty to name that palette after its main colour (the
    grey hint text in the box shows that name, and the swatch shows the colour).
-5. Click **Patch**. The button only turns on once a pak, a name and a rarity are set.
+5. Optionally add up to three **add-ons**: extra paks made for the same suit, such as a hair or weapon pak. Click
+   **Browse...** next to a slot to add one, **Remove** to take it out again.
+6. Click **Patch**. The button only turns on once a pak, a name and a rarity are set.
 
-The patched pak is written next to the original with `_patched` in its name: `CoolSuit_P.pak` becomes
+Everything goes into one patched pak: the suit and all its add-ons. The patched pak is written next to the original with `_patched` in its name: `CoolSuit_P.pak` becomes
 `CoolSuit_patched_P.pak`. The `_P` ending (and a number before it, as in `CoolSuit_9999_P.pak` →
 `CoolSuit_patched_9999_P.pak`) stays at the end, because Unreal uses it to load the mod over the game's files, so the
 patched pak loads exactly like the original did. The original is kept as `<name>.pak.bak` (the game ignores `.bak`
-files). To patch again with other names, browse to the patched pak or to the `.bak`: the patcher always starts from
-the original, and replaces the earlier patched pak. Then start the game: the SuitRegistry's `version.dll` sees the new
+files), and so is each add-on. To patch again with other names, browse to the patched pak or to the `.bak`: the
+patcher always starts from the original (and its add-ons, which come back in their slots), and replaces the earlier
+patched pak. Then start the game: the SuitRegistry's `version.dll` sees the new
 suit and registers it by itself.
 
 Close the game before patching a pak in the game's `Paks` folder.
@@ -44,6 +47,19 @@ There are two kinds of suit mods, and the patcher handles both:
   they're left as they are (the log lists them).
 - **Standalone suits**: they bring a new outfit, and usually their own `AssetRegistry.bin`. That registry would hide
   every other suit mod, so the patcher removes it and registers the outfit and its palettes through the SuitRegistry.
+
+**Add-ons** are treated as part of the mod: where they change the same file as the mod, the add-on's version is
+used. The suit is picked from the mod's own files. In a replacer, the add-on files that belong to the suit are copied
+with it and only change the new suit:
+
+- the suit's **weapon**: an outfit equips its own weapon item (e.g. Magik's Soulsword), so the weapon item, its
+  blueprint and the changed mesh and textures are copied for the new suit;
+- the **head and hair** (eyes, face, hair): a suit without a head or hair of its own wears the hero's default ones (set
+  on the hero's character template or its blueprint). When the mod or an add-on changes one of them, the new suit gets
+  a copy of it as its own.
+
+Add-on files that no suit uses (for example a sword mesh only seen in a cutscene) still change the game's own files,
+as the separate add-on pak did. The log says which is which.
 
 In both cases:
 

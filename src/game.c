@@ -270,11 +270,15 @@ static int contains_ci(const char *s, const char *sub)
     return 0;
 }
 
+int game_index_everything;                                      // test tool: index every folder
+
 static int index_filter(const char *dir, const char *name, void *ctx)
 {
     gindex *g = ctx;
-    int want = contains_ci(dir, "/Character/") || contains_ci(dir, "/TacticalOutfits/") || contains_ci(dir, "/Palettes/") ||
-               contains_ci(dir, "/Rarities/");
+    // suits, palettes, the heroes' models and character templates (default hair), weapon items and weapons
+    int want = game_index_everything || contains_ci(dir, "/Character/") || contains_ci(dir, "/TacticalOutfits/") || contains_ci(dir, "/Palettes/") ||
+               contains_ci(dir, "/Rarities/") || contains_ci(dir, "/Templates/Characters/Heroes/") ||
+               contains_ci(dir, "/Templates/Items/Weapons/") || contains_ci(dir, "/Weapons/");
     for (int i = 0; i < g->nextra && !want; i++) want = !_stricmp(dir, g->extra[i]);
     if (!_stricmp(dir, "CodaGame/")) return !name || !_strnicmp(name, "AssetRegistry", 13);   // the registries
     if (!want || _strnicmp(dir, "CodaGame/Content/", 17)) return 0;
