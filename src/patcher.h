@@ -3,7 +3,7 @@
 #include "upkg.h"
 
 #define MAX_PALETTES 16
-#define PATCHER_VERSION "1.0.0"
+#define PATCHER_VERSION "1.1.0"
 
 // ---- game files (game.c)
 typedef struct gindex gindex;
@@ -48,7 +48,9 @@ typedef struct clone_item clone_item;
 typedef struct {
     int mode;
     wchar_t *pak_path;                                          // the pak that is read (the original)
-    wchar_t *out_path;                                          // where the patched pak is written
+    wchar_t *orig_path;                                         // the original's own name (it becomes <name>.bak)
+    wchar_t *out_path;                                          // where the patched pak is written (<name>_patched)
+    wchar_t *stale_path;                                        // an earlier patched pak to remove (or NULL)
     wchar_t *paks_dir;                                          // the game's Paks folder
     char summary[1024];                                         // for the window
     char hero[16];                                              // e.g. MAGK

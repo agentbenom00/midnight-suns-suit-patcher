@@ -19,9 +19,13 @@ Get `SuitPatcher.exe` from the [latest release](../../releases/latest). The game
    grey hint text in the box shows that name, and the swatch shows the colour).
 5. Click **Patch**. The button only turns on once a pak, a name and a rarity are set.
 
-The patched pak replaces the original file, and the original is kept as `<name>.pak.bak` (the game ignores `.bak`
+The patched pak is written next to the original with `_patched` in its name: `CoolSuit_P.pak` becomes
+`CoolSuit_patched_P.pak`. The `_P` ending (and a number before it, as in `CoolSuit_9999_P.pak` →
+`CoolSuit_patched_9999_P.pak`) stays at the end, because Unreal uses it to load the mod over the game's files, so the
+patched pak loads exactly like the original did. The original is kept as `<name>.pak.bak` (the game ignores `.bak`
 files). To patch again with other names, browse to the patched pak or to the `.bak`: the patcher always starts from
-the original. Then start the game: the SuitRegistry's `version.dll` sees the new suit and registers it by itself.
+the original, and replaces the earlier patched pak. Then start the game: the SuitRegistry's `version.dll` sees the new
+suit and registers it by itself.
 
 Close the game before patching a pak in the game's `Paks` folder.
 

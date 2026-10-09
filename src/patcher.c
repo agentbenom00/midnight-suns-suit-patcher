@@ -14,6 +14,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <tlhelp32.h>
+#include <wchar.h>
 
 struct mod_file {
     char *path;                                                 // as in the mod pak
@@ -422,6 +423,29 @@ static char *nearest(list_ctx *l, const char *path)
     return best ? xstrdup(best) : NULL;
 }
 
+// name of the patched pak: <name>_patched_P.pak for <name>_P.pak. UE4 mounts paks ending in _P (after an optional
+// chunk version, <name>_<N>_P) with a higher priority, so that ending stays as it is, and so does the load order.
+static wchar_t *patched_path(const wchar_t *orig)
+{
+    const wchar_t *fn = wcsrchr(orig, L'\\');
+    size_t fs = fn ? (size_t)(fn + 1 - orig) : 0;
+    const wchar_t *dot = wcsrchr(orig + fs, L'.');
+    size_t end = dot ? (size_t)(dot - orig) : wcslen(orig);
+    size_t at = end;
+    if (end - fs >= 2 && orig[end - 2] == L'_' && towupper(orig[end - 1]) == L'P') {
+        at = end - 2;
+        size_t d = at;
+        while (d > fs && iswdigit(orig[d - 1])) d--;
+        if (d < at && d > fs + 1 && orig[d - 1] == L'_') at = d - 1;
+    }
+    size_t n = wcslen(orig);
+    wchar_t *r = xmalloc((n + 9) * sizeof(wchar_t));
+    wmemcpy(r, orig, at);
+    wmemcpy(r + at, L"_patched", 8);
+    wcscpy(r + at + 8, orig + at);
+    return r;
+}
+
 analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
 {
     analysis *a = xcalloc(1, sizeof *a);
@@ -437,13 +461,27 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
         if (_strnicmp(e[i].path, "CodaGame/SuitMods/", 18) || !ends_with(e[i].path, ".json")) continue;
         uint8_t *d = pak_read(&a->mod, &e[i], 1);
         json *j = json_parse((char *)d, (size_t)e[i].usize);
-        int ours = j && json_get(j, "patcher");
+        json *pj = j ? json_get(j, "patcher") : NULL;
+        int ours = pj != NULL;
+        // the original's file name, so its backup is found when this pak was renamed to <name>_patched
+        json *oj = pj ? json_get(pj, "original") : NULL;
+        wchar_t *orig_name = oj && oj->t == J_STR && oj->s[0] && !strpbrk(oj->s, "\\/:") ? utf8_to_w(oj->s) : NULL;
         json_free(j);
         free(d);
         size_t pl = wcslen(pak_path);
         if (ours && !(pl > 4 && !_wcsicmp(pak_path + pl - 4, L".bak"))) {
-            wchar_t *bak = xmalloc((pl + 8) * sizeof(wchar_t));
-            swprintf(bak, pl + 8, L"%ls.bak", pak_path);
+            wchar_t *bak;
+            if (orig_name) {
+                const wchar_t *fn = wcsrchr(pak_path, L'\\');
+                size_t dl = fn ? (size_t)(fn + 1 - pak_path) : 0, bl = dl + wcslen(orig_name) + 8;
+                bak = xmalloc(bl * sizeof(wchar_t));
+                wmemcpy(bak, pak_path, dl);
+                swprintf(bak + dl, bl - dl, L"%ls.bak", orig_name);
+            } else {
+                bak = xmalloc((pl + 8) * sizeof(wchar_t));
+                swprintf(bak, pl + 8, L"%ls.bak", pak_path);
+            }
+            free(orig_name);
             pak_entries_free(e, nf);
             pak_close(&a->mod);
             if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES)
@@ -451,12 +489,13 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
                         "original download instead.", bak);
             log_msg("this pak was already patched: starting again from its backup");
             analysis *b = analyze_pak(bak, game_paks);
-            free(b->out_path);
-            b->out_path = _wcsdup(pak_path);
+            // a pak patched under another name (or in place, by version 1.0.0) goes once the new one is written
+            if (_wcsicmp(pak_path, b->out_path)) b->stale_path = _wcsdup(pak_path);
             free(bak);
             analysis_free(a);
             return b;
         }
+        free(orig_name);
         if (!ours) {
             pak_entries_free(e, nf);
             sr_fail("this pak already has a SuitRegistry manifest (%s), so it works with the SuitRegistry as it is",
@@ -464,10 +503,11 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *game_paks)
         }
     }
     size_t pl = wcslen(pak_path);
-    a->out_path = _wcsdup(pak_path);
-    if (pl > 4 && !_wcsicmp(pak_path + pl - 4, L".bak")) a->out_path[pl - 4] = 0;
-    const wchar_t *fn = wcsrchr(a->out_path, L'\\');
-    a->source_name = w_to_utf8(fn ? fn + 1 : a->out_path);
+    a->orig_path = _wcsdup(pak_path);
+    if (pl > 4 && !_wcsicmp(pak_path + pl - 4, L".bak")) a->orig_path[pl - 4] = 0;
+    a->out_path = patched_path(a->orig_path);
+    const wchar_t *fn = wcsrchr(a->orig_path, L'\\');
+    a->source_name = w_to_utf8(fn ? fn + 1 : a->orig_path);
 
     // files and packages of the mod
     ctx c = {a, {0}};
@@ -741,7 +781,8 @@ void analysis_free(analysis *a)
     for (int i = 0; i < a->npal; i++) { free(a->pal[i].pkg); free(a->pal[i].old_name); }
     if (a->mod.h) pak_close(&a->mod);
     game_close(a->game);
-    free(a->pak_path); free(a->out_path); free(a->paks_dir); free(a->outfit); free(a->outfit_name); free(a->source_name);
+    free(a->pak_path); free(a->orig_path); free(a->out_path); free(a->stale_path); free(a->paks_dir);
+    free(a->outfit); free(a->outfit_name); free(a->source_name);
     free(a);
 }
 
@@ -1082,12 +1123,15 @@ patch_result run_patch(analysis *a, const patch_options *o)
     pak_write_end(w);
     sr_jmp = outer;
 
-    // swap it in: the original becomes <name>.pak.bak (unless we read from that backup already)
+    // swap it in: the original becomes <name>.pak.bak (unless we read from that backup already), and the patched pak
+    // is <name>_patched.pak
     pak_close(&a->mod);
-    wchar_t *bak = xmalloc((ol + 16) * sizeof(wchar_t));
-    swprintf(bak, ol + 16, L"%ls.bak", a->out_path);
-    if (!_wcsicmp(a->pak_path, a->out_path)) {
-        if (!MoveFileExW(a->out_path, bak, MOVEFILE_REPLACE_EXISTING)) {
+    size_t gl = wcslen(a->orig_path);
+    wchar_t *bak = xmalloc((gl + 8) * sizeof(wchar_t));
+    swprintf(bak, gl + 8, L"%ls.bak", a->orig_path);
+    int from_backup = _wcsicmp(a->pak_path, a->orig_path) != 0;
+    if (!from_backup) {
+        if (!MoveFileExW(a->orig_path, bak, MOVEFILE_REPLACE_EXISTING)) {
             DWORD err = GetLastError();
             DeleteFileW(tmp);
             sr_fail(err == ERROR_SHARING_VIOLATION || err == ERROR_ACCESS_DENIED
@@ -1103,6 +1147,25 @@ patch_result run_patch(analysis *a, const patch_options *o)
         DWORD err = GetLastError();
         sr_fail("could not write %ls (error %lu); the patched pak is %ls", a->out_path, err, tmp);
     }
+    // nothing else may load the mod a second time: a pak under the original's name (when patching from the backup;
+    // earlier versions patched in place) or an earlier patched pak under another name
+    if (from_backup && GetFileAttributesW(a->orig_path) != INVALID_FILE_ATTRIBUTES) {
+        if (DeleteFileW(a->orig_path)) log_msg("removed %ls (the backup is the original)", a->orig_path);
+        else {
+            DWORD err = GetLastError();
+            log_msg("could not remove %ls (error %lu): delete it, or the mod loads twice", a->orig_path, err);
+        }
+    }
+    if (a->stale_path && _wcsicmp(a->stale_path, a->orig_path)) {
+        if (DeleteFileW(a->stale_path)) log_msg("removed %ls (patched before, replaced now)", a->stale_path);
+        else {
+            DWORD err = GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND)
+                log_msg("could not remove %ls (error %lu): delete it, or the suit shows up twice", a->stale_path, err);
+        }
+    }
+    free(a->stale_path);
+    a->stale_path = NULL;
     // reopen the source so the same analysis can patch again (with other names)
     pak_open(&a->mod, res.backup_path, 1);
     if (_wcsicmp(a->pak_path, res.backup_path)) { free(a->pak_path); a->pak_path = _wcsdup(res.backup_path); }
