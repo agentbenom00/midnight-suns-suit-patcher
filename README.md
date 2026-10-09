@@ -4,6 +4,11 @@ A small Windows tool (it also runs under Wine and Proton on Linux) that makes a 
 work with the [Midnight Suns Suit Registry](https://github.com/agentbenom00/midnight-suns-suit-registry). The patched
 mod becomes a **suit of its own**, with your chosen name, rarity and palette names, next to the hero's other suits.
 
+## Download
+
+Get `SuitPatcher.exe` from the [latest release](../../releases/latest). The game needs the
+[SuitRegistry](https://github.com/agentbenom00/midnight-suns-suit-registry) installed for the patched suits to show up.
+
 ## Using it
 
 1. Run `SuitPatcher.exe`.
