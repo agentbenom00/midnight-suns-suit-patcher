@@ -114,12 +114,14 @@ void pak_close(pak *pk);
 pak_entry *pak_list(pak *pk, pak_filter f, void *ctx, int *count);
 void pak_entries_free(pak_entry *e, int count);
 uint8_t *pak_read(pak *pk, pak_entry *e, int allow_oodle);  // NULL + sr_error if it can't (e.g. Oodle not loaded)
+uint8_t *pak_read_head(pak *pk, pak_entry *e, int64_t n, int allow_oodle);   // the first n bytes (fewer if shorter)
 
 typedef struct { const char *path; const uint8_t *data; size_t n; int compress; } pak_out_file;
 typedef struct pak_writer pak_writer;
 pak_writer *pak_write_begin(const wchar_t *tmp_path);       // NULL: could not create (GetLastError)
 void pak_write_file(pak_writer *w, const char *path, const uint8_t *data, size_t n, int compress);
 void pak_write_end(pak_writer *w);
+void pak_write_abort(pak_writer *w);                        // closes it, nothing written (the caller deletes the file)
 
 // ---- JSON (just enough for manifests)
 typedef enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } jtype;

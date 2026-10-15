@@ -1,13 +1,13 @@
 # Midnight Suns Suit Patcher
 
 A small Windows tool (it also runs under Wine and Proton on Linux) that makes a **Marvel's Midnight Suns** suit mod
-work with the [Midnight Suns Suit Registry](https://github.com/agentbenom00/midnight-suns-suit-registry). The patched
+work with the [MMS Registry](https://github.com/agentbenom00/mms-registry). The patched
 mod becomes a **suit of its own**, with your chosen name, rarity and palette names, next to the hero's other suits.
 
 ## Download
 
 Get `SuitPatcher.exe` from the [latest release](../../releases/latest). The game needs the
-[SuitRegistry](https://github.com/agentbenom00/midnight-suns-suit-registry) installed for the patched suits to show up.
+[MMS Registry](https://github.com/agentbenom00/mms-registry) (formerly the Suit Registry) installed for the patched suits to show up.
 
 ## Using it
 
@@ -27,7 +27,7 @@ Everything goes into one patched pak: the suit and all its add-ons. The patched 
 patched pak loads exactly like the original did. The original is kept as `<name>.pak.bak` (the game ignores `.bak`
 files), and so is each add-on. To patch again with other names, browse to the patched pak or to the `.bak`: the
 patcher always starts from the original (and its add-ons, which come back in their slots), and replaces the earlier
-patched pak. Then start the game: the SuitRegistry's `version.dll` sees the new
+patched pak. Then start the game: the MMS Registry's `version.dll` sees the new
 suit and registers it by itself.
 
 Close the game before patching a pak in the game's `Paks` folder.
@@ -44,9 +44,21 @@ There are two kinds of suit mods, and the patcher handles both:
   that suit and the mod's files under new names (`<name>_<YourSuitName>`). The copies are the outfit, its palettes,
   the mod's files and any game file in between, such as a material that points at a modded texture. The original
   suit goes back to normal, and the copy is a new suit. If some of the mod's changed files aren't part of that suit,
-  they're left as they are (the log lists them).
+  they're left as they are (the log lists them), and they use the new suit's copies of the mod's files they point
+  at, so they look as they did with the original mod.
+- **Abbey outfit replacers**: a mod that changes one of a hero's Abbey outfits (the clothes worn in the Abbey) is
+  copied the same way and becomes a new Abbey outfit. Abbey outfits have no palettes to choose from: each one wears
+  its own colours. Abbey outfits are only considered when none of the battle suits uses the mod's files (some Abbey
+  outfits wear parts of the hero's suit, such as Doctor Strange's cape).
+- **Looks made of pieces**: the Hunter's battle look is a suit plus a separate head piece (a helmet or hood). When a
+  mod changes both, both are copied, and the new suit is two items with the same name.
+
+DLC heroes whose files are in a plugin (Morbius, Storm) are handled like the others.
+
+A mod's changes to the game's portraits and icons (a hero's head portrait or logo) are left out: they would change
+the hero's own, whatever suit is worn. The suit's own icon is copied with the suit when the mod changes it.
 - **Standalone suits**: they bring a new outfit, and usually their own `AssetRegistry.bin`. That registry would hide
-  every other suit mod, so the patcher removes it and registers the outfit and its palettes through the SuitRegistry.
+  every other suit mod, so the patcher removes it and registers the outfit and its palettes through the MMS Registry.
 
 **Add-ons** are treated as part of the mod: where they change the same file as the mod, the add-on's version is
 used. The suit is picked from the mod's own files. In a replacer, the add-on files that belong to the suit are copied
@@ -67,10 +79,18 @@ In both cases:
   the start and free.
 - Each palette gets its name and a new `EntitlementID`, is free, and is listed only for the new suit. Mods can't
   sell or grant items, so suits and palettes must be free.
-- A manifest goes into the pak, `CodaGame/SuitMods/<HERO>_<Name>.json`. It tells the SuitRegistry which game registry
+- A manifest goes into the pak, `CodaGame/SuitMods/<HERO>_<Name>.json`. It tells the MMS Registry which game registry
   entries to clone for the new packages.
 
 Only game items that have a registry entry are used: palettes that the game itself doesn't register are left out.
+
+**Outdated materials**: a mod made for an older version of the game can carry material instances whose compiled
+shaders the game no longer has (a game update recompiled them), so the game draws them plain grey. The patcher checks
+each of the mod's material instances against the game's shader library (`ShaderArchive-CodaGame-PCD3D_SM5`). One that
+isn't there is rebuilt from the game material it was made from (the game's own version of an overridden material, or
+else the best fitting one with the same parent, in its folder or further up): the game's current data, with the mod's
+textures and values put in. The log says which materials were updated, and when a switch now follows the game's
+material.
 
 ## Building
 
@@ -90,7 +110,7 @@ Cross-compiled from Linux with [zig](https://ziglang.org/) 0.13 (plain C, Win32,
 | `src/upkg.c` | cooked UE 4.26 packages: name map, imports/exports, tagged properties, renames with offset fix-ups |
 | `src/game.c` | finding the game, indexing its paks |
 | `src/colors.c` | palette colours and colour names |
-| `src/pak.c`, `zlib.c`, `oodle.c`, `json.c`, `registry.c`, `util.c` | shared with the SuitRegistry DLL: paks, compression, Oodle, JSON, AssetRegistry, helpers |
+| `src/pak.c`, `zlib.c`, `oodle.c`, `json.c`, `registry.c`, `util.c` | shared with the MMS Registry DLL: paks, compression, Oodle, JSON, AssetRegistry, helpers |
 
 The package renaming is checked byte for byte against [UAssetAPI](https://github.com/atenfyr/UAssetAPI), and the
 results are read back with [CUE4Parse](https://github.com/FabianFG/CUE4Parse).
@@ -98,7 +118,7 @@ results are read back with [CUE4Parse](https://github.com/FabianFG/CUE4Parse).
 ## Credits
 
 - Oodle is downloaded at runtime from [WorkingRobot/OodleUE](https://github.com/WorkingRobot/OodleUE) builds (the
-  same way the SuitRegistry does, and into the same cache folder); it isn't part of this project.
+  same way the MMS Registry does, and into the same cache folder); it isn't part of this project.
 - Package, pak and AssetRegistry formats as documented by CUE4Parse, UAssetAPI and [repak](https://github.com/trumank/repak).
 - Not affiliated with or endorsed by Firaxis, 2K or Marvel.
 

@@ -5,7 +5,8 @@
 #define MAX_PALETTES 16
 #define NLOOKS 2                                                // head, hair
 #define MAX_ADDONS 3                                            // add-on paks (hair, weapon, ...) merged into the suit
-#define PATCHER_VERSION "1.2.0"
+#define MAX_PIECES 3                                            // more outfits of one look (the Hunter's suit + helmet)
+#define PATCHER_VERSION "1.3.0"
 
 // ---- game files (game.c)
 typedef struct gindex gindex;
@@ -20,6 +21,8 @@ extern int game_index_everything;                               // test tool: in
 void game_close(gindex *g);
 int game_has(gindex *g, const char *path);                      // pak path, e.g. CodaGame/Content/A/B.uasset
 uint8_t *game_read(gindex *g, const char *path, size_t *n);     // NULL if absent
+uint8_t *game_read_head(gindex *g, const char *path, size_t want, size_t *n);   // the first `want` bytes
+#define GAME_SHADER_LIB "CodaGame/Content/ShaderArchive-CodaGame-PCD3D_SM5.ushaderbytecode"   // D3D (also under Proton)
 typedef void (*game_each_fn)(const char *path, void *ctx);
 void game_each(gindex *g, game_each_fn f, void *ctx);           // every indexed file
 
@@ -62,6 +65,9 @@ typedef struct {
     char summary[1024];                                         // for the window
     char hero[16];                                              // e.g. MAGK
     char *outfit;                                               // /Game path of the suit's outfit
+    int abbey;                                                  // it is an Abbey outfit (replacer mode)
+    char *piece[MAX_PIECES]; int npieces;                       // more outfits of the look (e.g. the Hunter's helmet)
+    char **slots; int nslots;                                   // material slots the copies get their own names for
     char *outfit_name;                                          // its in-game name
     pal_info pal[MAX_PALETTES]; int npal;
     // internals

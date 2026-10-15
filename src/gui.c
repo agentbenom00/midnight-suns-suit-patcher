@@ -42,10 +42,18 @@ static void gui_log(const char *line)
     if (!PostMessageW(wnd, WM_LOGLINE, 0, (LPARAM)w)) free(w);
 }
 
+// (the box keeps the latest messages; SuitPatcher.log has them all)
 static void log_append(const wchar_t *s)
 {
     int n = GetWindowTextLengthW(h_log);
-    if (n > 60000) { SendMessageW(h_log, EM_SETSEL, 0, 20000); SendMessageW(h_log, EM_REPLACESEL, FALSE, (LPARAM)L""); n = GetWindowTextLengthW(h_log); }
+    if (n > 60000) {                                            // drop the oldest third, whole lines
+        int line = (int)SendMessageW(h_log, EM_LINEFROMCHAR, 20000, 0);
+        int cut = (int)SendMessageW(h_log, EM_LINEINDEX, line + 1, 0);
+        if (cut <= 0) cut = 20000;
+        SendMessageW(h_log, EM_SETSEL, 0, cut);
+        SendMessageW(h_log, EM_REPLACESEL, FALSE, (LPARAM)L"");
+        n = GetWindowTextLengthW(h_log);
+    }
     SendMessageW(h_log, EM_SETSEL, n, n);
     if (n) SendMessageW(h_log, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
     SendMessageW(h_log, EM_REPLACESEL, FALSE, (LPARAM)s);
@@ -122,6 +130,7 @@ static void show_palettes(void)
     }
     const wchar_t *hint = !cur ? L"Browse to a suit mod to see its palettes."
                         : n ? L"Leave a box empty to name that palette after its main colour."
+                        : cur->abbey ? L"An Abbey outfit has no palettes to choose from: it keeps its own colours."
                             : L"This suit has no palettes.";
     SetWindowTextW(h_palhint, hint);
 }
@@ -210,6 +219,7 @@ static void new_mod(const wchar_t *file)
     if (busy) return;
     for (int i = 0; i < MAX_ADDONS; i++) { free(addon_sel[i]); addon_sel[i] = NULL; }
     show_addons();
+    SetWindowTextW(h_log, L"");                                 // a fresh log for each mod (SuitPatcher.log keeps all)
     start_analysis(file, NULL);
 }
 
@@ -353,9 +363,10 @@ static HWND make(const wchar_t *cls, const wchar_t *text, DWORD style, int x, in
 static void create_controls(void)
 {
     const int L = 16, W = 608;
-    HWND t = make(L"STATIC", L"Midnight Suns Suit Patcher", 0, L, 12, W, 26, 0, 0);
+    // (a 20 px Segoe UI line is 27 px tall with its descenders: the subtitle starts below that)
+    HWND t = make(L"STATIC", L"Midnight Suns Suit Patcher", 0, L, 10, W, 30, 0, 0);
     SendMessageW(t, WM_SETFONT, (WPARAM)font_title, FALSE);
-    HWND st = make(L"STATIC", L"Turns a suit mod into a suit of its own that works with the SuitRegistry.", 0, L, 38, W, 18, 0, 0);
+    HWND st = make(L"STATIC", L"Turns a suit mod into a suit of its own that works with the MMS Registry.", 0, L, 42, W, 18, 0, 0);
     SendMessageW(st, WM_SETFONT, (WPARAM)font_small, FALSE);
 
     make(L"STATIC", L"Suit mod (.pak):", 0, L, 70, W, 18, 0, 0);
@@ -412,6 +423,8 @@ static void create_controls(void)
     SendMessageW(need, WM_SETFONT, (WPARAM)font_small, FALSE);
     h_log = make(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, L, 613, W, 88, ID_LOG, WS_EX_CLIENTEDGE);
     SendMessageW(h_log, WM_SETFONT, (WPARAM)font_small, FALSE);
+    // an edit box takes only 32767 characters by default: past that, new messages were silently not shown
+    SendMessageW(h_log, EM_SETLIMITTEXT, 0, 0);
     show_palettes();
     update_buttons();
 }
@@ -487,11 +500,11 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             const wchar_t *fn = wcsrchr(r->out_path, L'\\');
             const wchar_t *bn = wcsrchr(r->backup_path, L'\\');
             swprintf(msg, 2048, L"Done! %ls is now a suit of its own.\n\nThe original mod is kept as %ls%ls (the game ignores "
-                                L"it).\n\nStart the game: the SuitRegistry registers the new suit by itself.%ls",
+                                L"it).\n\nStart the game: the MMS Registry registers the new suit by itself.%ls",
                      fn ? fn + 1 : r->out_path, bn ? bn + 1 : r->backup_path,
                      cur->naddons ? L", and the add-ons as .bak files too" : L"",
                      registry_installed(cur->paks_dir) ? L""
-                     : L"\n\nNote: the SuitRegistry (version.dll) doesn't seem to be installed in this game. Install it, "
+                     : L"\n\nNote: the MMS Registry (version.dll) doesn't seem to be installed in this game. Install it, "
                        L"or the new suit won't show up.");
             snapshot(".2.bmp");
             if (GetEnvironmentVariableW(L"SUITPATCHER_AUTOFILL", NULL, 0)) { PostQuitMessage(0); return 0; }

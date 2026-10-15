@@ -45,6 +45,7 @@ const char *upkg_short(const char *pkg_path);                   // "/Game/A/B" -
 
 // every "/Game/..." package this one refers to (imports and soft references), malloc'd strings
 char **upkg_refs(upkg *p, int *n);
+size_t upkg_mount_len(const char *s);                          // "/Game/" (or a plugin's mount) length, 0 = not a content path
 
 // package renames: old -> new package path, e.g. /Game/A/X -> /Game/A/X_Tag
 typedef struct { char **from, **to; int n; } rename_map;
@@ -75,6 +76,22 @@ void prop_set_softpath(upkg *p, int exp, const char *name, const char *path);
 void prop_set_guid(upkg *p, int exp, const char *name, const uint8_t guid[16]);
 int prop_get_guid(upkg *p, int exp, const char *name, uint8_t guid[16]);
 // soft-path array: keep only the entries equal to `keep`; returns how many entries were removed
-int prop_filter_softarray(upkg *p, int exp, const char *name, const char *keep);
+int prop_filter_softarray(upkg *p, int exp, const char *name, const char *keep);   // keep: entries separated by |
 // linear colours of a LinearColor array property (e.g. CustomInventoryIconColors); count, up to max
 int prop_get_colors(upkg *p, int exp, const char *name, float (*rgba)[4], int max);
+
+// ---- material instances
+typedef struct {
+    char name[96];                                              // parameter name
+    const char *type;                                           // of its value, e.g. FloatProperty, ObjectProperty
+    size_t val; int32_t size;                                   // the value (in ue); a switch's: its Value byte
+    int override;                                               // static switch: bOverride
+} mparam;
+// parameters of material instance export e: `array` is ScalarParameterValues, VectorParameterValues,
+// TextureParameterValues or StaticSwitchParameters (inside StaticParameters); count, up to max
+int mat_params(upkg *p, int exp, const char *array, mparam *out, int max);
+// ---- palettes: which material a palette puts on which material slot (MaterialSlotsData); count, up to max
+typedef struct { char slot[96]; char mat[512]; } pslot;         // mat: package path, "" if none
+int palette_slots(upkg *p, int exp, pslot *out, int max);
+// package path of the object import `idx` (an ObjectProperty value < 0) is in, NULL if it isn't an import
+const char *upkg_import_package(upkg *p, int32_t idx);

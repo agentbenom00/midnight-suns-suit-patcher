@@ -12,6 +12,9 @@
 // registry entries to clone for the new packages.
 // Add-on paks (hair, weapon, ... made for the same suit) are merged in as if they were part of the mod: the files of
 // theirs that the suit uses are cloned with it, and everything goes into the one patched pak.
+// Material instances made for an older version of the game (their compiled shaders are no longer in the game's shader
+// library, so the game draws them grey) are rebuilt from the game material they were made from, with the mod's textures
+// and values.
 #include "patcher.h"
 #include <ctype.h>
 #include <math.h>
@@ -35,6 +38,8 @@ struct mod_pkg {
     int src;                                                    // where its .uasset comes from (mod_file.src)
     char *cls;                                                  // class of its main export
     int in_clone;                                               // moved to a new name
+    char *shader_donor;                                         // outdated material: the game's one it is rebuilt from
+    int left_out;                                               // a game UI file (portrait, logo) the suit doesn't use
 };
 
 enum { K_OTHER, K_OUTFIT, K_PALETTE };
@@ -103,6 +108,7 @@ static void smap_free(smap *m)
 typedef struct {
     analysis *a;
     smap mods;                                                  // /Game path -> mod package
+    int fix;                                                    // patching: outdated materials come rebuilt
 } ctx;
 
 static int ends_with(const char *s, const char *e)
@@ -128,11 +134,17 @@ static int is_indexed(ctx *c, const char *game)
     return r;
 }
 
+static upkg *refresh_material(ctx *c, int m, const char *donor, int quiet);
+
 // the package (header only, or with its .uexp); NULL if neither the mod nor the game has it
 static upkg *load_pkg(ctx *c, const char *game, int full, int *from_mod)
 {
     analysis *a = c->a;
     int m = smap_get(&c->mods, game);
+    if (c->fix && full && m >= 0 && a->pkgs[m].shader_donor) {
+        if (from_mod) *from_mod = m;
+        return refresh_material(c, m, a->pkgs[m].shader_donor, 1);
+    }
     size_t an = 0, en = 0;
     uint8_t *ua = NULL, *ue = NULL;
     if (m >= 0 && a->pkgs[m].fu >= 0) {
@@ -453,6 +465,376 @@ static char *nearest(list_ctx *l, const char *path)
     return best ? xstrdup(best) : NULL;
 }
 
+// the category of a tactical outfit (its TacticalOutfitPieceCategory package: a suit, a head prop, ...), "" if none
+static char *outfit_category(ctx *c, const char *outfit)
+{
+    upkg *u = NULL;
+    jmp_buf j, *outer = sr_jmp;
+    sr_jmp = &j;
+    if (!setjmp(j)) u = load_pkg(c, outfit, 1, NULL);
+    sr_jmp = outer;
+    const char *cat = NULL;
+    ptag t;
+    int e = u ? upkg_main_export(u) : -1;
+    if (e >= 0 && prop_find(u, e, "TacticalOutfitPieceCategory", &t) && !strcmp(t.type, "ObjectProperty") && t.size >= 4)
+        cat = upkg_import_package(u, (int32_t)rd32(u->ue + t.val));
+    char *r = xstrdup(cat ? cat : "");
+    upkg_free(u);
+    return r;
+}
+
+// The hero's own palettes (DefaultPalettes on the character template, e.g. Spider-Man's Default) apply to every suit
+// of the hero. One that puts a game material on a slot, where the new suit has its own copy of that material, would
+// paint the game's original over the new suit (the mod's mesh with the game's textures). Those slots get their own
+// names in the copies (meshes, palettes, outfit), so the hero's palette leaves them alone.
+static void hero_palette_slots(ctx *c)
+{
+    analysis *a = c->a;
+    upkg *u = load_pkg(c, a->outfit, 0, NULL);
+    int nr;
+    char **refs = upkg_refs(u, &nr), *chr = NULL;
+    upkg_free(u);
+    for (int i = 0; i < nr; i++) {
+        if (!chr && strstr(refs[i], "/Templates/Characters/Hero")) chr = refs[i];
+        else free(refs[i]);
+    }
+    free(refs);
+    if (!chr) return;
+    upkg *cu = NULL;
+    jmp_buf j, *outer = sr_jmp;
+    sr_jmp = &j;
+    if (!setjmp(j)) cu = load_pkg(c, chr, 0, NULL);
+    sr_jmp = outer;
+    char **crefs = cu ? upkg_refs(cu, &nr) : NULL;
+    upkg_free(cu);
+    for (int i = 0; crefs && i < nr; i++) {
+        upkg *p = NULL;
+        if (strstr(crefs[i], "/Palettes/")) {
+            sr_jmp = &j;
+            if (!setjmp(j)) p = load_pkg(c, crefs[i], 1, NULL);
+            sr_jmp = outer;
+        }
+        static pslot ps[64];
+        int n = p ? palette_slots(p, upkg_main_export(p), ps, 64) : 0;
+        for (int k = 0; k < n; k++) {
+            int copied = 0;
+            for (int q = 0; q < a->nitems && !copied; q++) copied = a->items[q].rename && !_stricmp(a->items[q].game, ps[k].mat);
+            int have = 0;
+            for (int q = 0; q < a->nslots; q++) have |= !_stricmp(a->slots[q], ps[k].slot);
+            if (!copied || have || !ps[k].slot[0]) continue;
+            a->slots = xrealloc(a->slots, sizeof(char *) * (a->nslots + 1));
+            a->slots[a->nslots++] = xstrdup(ps[k].slot);
+            log_msg("the hero's %s puts the game's %s on slot %s: the new suit's slot gets a name of its own",
+                    upkg_short(crefs[i]), upkg_short(ps[k].mat), ps[k].slot);
+        }
+        upkg_free(p);
+        free(crefs[i]);
+    }
+    free(crefs);
+    free(chr);
+}
+
+// The mod's changes to the game's UI files (a hero's portrait, logo or icon) that the suit doesn't use would change
+// them for the hero as a whole, whatever suit is worn: they are left out, so the game's own stay
+static void leave_out_ui(analysis *a)
+{
+    int n = 0;
+    for (int m = 0; m < a->npkgs; m++) {
+        mod_pkg *mp = &a->pkgs[m];
+        if (!mp->override || mp->in_clone || !strstr(mp->game, "/UI/")) continue;
+        mp->left_out = 1;
+        for (int i = 0; i < a->nfiles; i++) if (a->files[i].pkg == m) a->files[i].drop = 1;
+        if (!n++) log_msg("left out: the mod's changes to the game's portraits and icons (they would change the hero's own, "
+                          "whatever suit is worn):");
+        log_msg("  %s", mp->game);
+    }
+}
+
+// ---------------------------------------------------------------- outdated materials
+// A cooked material instance with its own shader permutation (bHasStaticPermutationResource) keeps only the hash of
+// its compiled shaders; the shaders are in the game's shader library. After a game update recompiled them, a mod's old
+// copy points at shaders that are gone, and the game draws it with its default (grey) material. Such a material is
+// rebuilt from the game's current one it was made from: same parent, switches and layout, with the mod's textures and
+// values put in.
+
+#define HASH 20
+
+typedef struct { uint8_t *h; int n; int state; } shader_lib;     // sorted shader map hashes; state 0 unread, 1 ok, -1 none
+
+static int cmp_hash(const void *x, const void *y) { return memcmp(x, y, HASH); }
+
+// shader map hashes of a library (FSerializedShaderArchive version 2: count, then the hashes)
+static void lib_add(shader_lib *l, const uint8_t *d, size_t n)
+{
+    if (n < 8 || rd32(d) != 2) return;
+    int32_t k = (int32_t)rd32(d + 4);
+    if (k <= 0 || (size_t)k > (n - 8) / HASH) return;
+    l->h = xrealloc(l->h, (size_t)(l->n + k) * HASH);
+    memcpy(l->h + (size_t)l->n * HASH, d + 8, (size_t)k * HASH);
+    l->n += k;
+}
+
+static int lib_load(analysis *a, shader_lib *l)
+{
+    if (l->state) return l->state > 0;
+    l->state = -1;
+    size_t n;
+    uint8_t *d = game_read_head(a->game, GAME_SHADER_LIB, 8, &n);
+    if (!d) { log_msg("note: the game's shader library was not found, so the mod's materials were not checked"); return 0; }
+    int32_t k = n == 8 && rd32(d) == 2 ? (int32_t)rd32(d + 4) : -1;
+    free(d);
+    if (k <= 0 || k > 10000000) { log_msg("note: the game's shader library could not be read; materials not checked"); return 0; }
+    d = game_read_head(a->game, GAME_SHADER_LIB, 8 + (size_t)k * HASH, &n);
+    lib_add(l, d, n);
+    free(d);
+    // a mod may bring shaders of its own
+    for (int i = 0; i < a->nfiles; i++)
+        if (!a->files[i].drop && ends_with(a->files[i].path, ".ushaderbytecode")) {
+            d = mod_read(a, i, &n);
+            lib_add(l, d, n);
+            free(d);
+        }
+    qsort(l->h, (size_t)l->n, HASH, cmp_hash);
+    l->state = 1;
+    return 1;
+}
+
+// 1 if the export data names a shader map the library has
+static int lib_knows(shader_lib *l, const uint8_t *d, size_t n)
+{
+    for (size_t o = 0; o + HASH <= n; o++)
+        if (bsearch(d + o, l->h, (size_t)l->n, HASH, cmp_hash)) return 1;
+    return 0;
+}
+
+static upkg *mod_pkg_load(analysis *a, int m)
+{
+    mod_pkg *mp = &a->pkgs[m];
+    size_t an = 0, en = 0;
+    uint8_t *ua = mod_read(a, mp->fu, &an), *ue = mp->fe >= 0 ? mod_read(a, mp->fe, &en) : NULL;
+    return upkg_load(ua, an, ue, en);
+}
+
+static upkg *game_pkg_load(analysis *a, const char *game, int full)
+{
+    size_t an = 0, en = 0;
+    char *p = game_to_pak(game, ".uasset");
+    uint8_t *ua = game_read(a->game, p, &an), *ue = NULL;
+    free(p);
+    if (!ua) return NULL;
+    if (full) { p = game_to_pak(game, ".uexp"); ue = game_read(a->game, p, &en); free(p); }
+    return upkg_load_ex(ua, an, ue, en, !full);
+}
+
+#define MAXP 128
+
+// package of the material instance's parent material, NULL if none
+static const char *mat_parent(upkg *u, int e)
+{
+    ptag t;
+    if (!prop_find(u, e, "Parent", &t) || strcmp(t.type, "ObjectProperty") || t.size < 4) return NULL;
+    return upkg_import_package(u, (int32_t)rd32(u->ue + t.val));
+}
+
+static int is_mic(upkg *u, int e) { return e >= 0 && !strcmp(upkg_class_of(u, e), "MaterialInstanceConstant"); }
+
+static const mparam *param_named(const mparam *v, int n, const char *name)
+{
+    for (int i = 0; i < n; i++) if (!_stricmp(v[i].name, name)) return &v[i];
+    return NULL;
+}
+
+// how well game material `g` fits as the donor of mod material `u` (both full, same parent): -1 = not at all
+static int donor_score(upkg *u, upkg *g, const char *mod_path, const char *game_path)
+{
+    int eu = upkg_main_export(u), eg = upkg_main_export(g);
+    mparam su[MAXP], sg[MAXP];
+    int nu = mat_params(u, eu, "StaticSwitchParameters", su, MAXP), ng = mat_params(g, eg, "StaticSwitchParameters", sg, MAXP);
+    int same = nu == ng;
+    for (int i = 0; i < nu && same; i++) {
+        const mparam *q = param_named(sg, ng, su[i].name);
+        same = q && q->override == su[i].override && u->ue[su[i].val] == g->ue[q->val];
+    }
+    int score = same ? 1000 : 0;
+    if (u->ue_n == g->ue_n) score += 100;                       // a copy keeps the layout
+    return score + (int)common_prefix(upkg_short(mod_path), upkg_short(game_path));
+}
+
+typedef struct { char **v; int n; const char *prefix; } path_list2;
+
+static void list_under(const char *path, void *p)
+{
+    path_list2 *l = p;
+    if (!ends_with(path, ".uasset") || _strnicmp(path, l->prefix, strlen(l->prefix))) return;
+    l->v = xrealloc(l->v, sizeof(char *) * (l->n + 1));
+    l->v[l->n++] = pak_to_game(path);
+}
+
+// the game material the mod's material `u` (/Game path `path`) was made from: the game's own version of an overridden
+// one, else the best fitting material instance with the same parent, looking in its folder and then further up
+static char *find_donor(analysis *a, upkg *u, const char *path, int override)
+{
+    int e = upkg_main_export(u);
+    const char *parent = mat_parent(u, e);
+    if (!parent) return NULL;
+    if (override) {
+        upkg *g = game_pkg_load(a, path, 1);
+        int ok = g && is_mic(g, upkg_main_export(g)) && mat_parent(g, upkg_main_export(g)) &&
+                 !_stricmp(mat_parent(g, upkg_main_export(g)), parent);
+        upkg_free(g);
+        if (ok) return xstrdup(path);
+    }
+    char *dir = game_to_pak(path, ""), *prev = NULL;            // prev: the folder searched before (with its subfolders)
+    char *best = NULL;
+    int best_score = -1;
+    for (int level = 0; level < 4 && !best; level++) {
+        char *sl = strrchr(dir, '/');
+        if (!sl || sl - dir <= 17) break;                       // not above CodaGame/Content/<top>/
+        sl[1] = 0;
+        path_list2 l = {NULL, 0, dir};
+        game_each(a->game, list_under, &l);
+        for (int i = 0; i < l.n; i++) {
+            char *gp = game_to_pak(l.v[i], ".uasset");
+            int skip = prev && !_strnicmp(gp, prev, strlen(prev));
+            free(gp);
+            if (skip || !_stricmp(l.v[i], path)) { free(l.v[i]); continue; }
+            upkg *h = NULL;
+            jmp_buf j, *outer = sr_jmp;
+            sr_jmp = &j;
+            if (!setjmp(j)) h = game_pkg_load(a, l.v[i], 0);
+            sr_jmp = outer;
+            int fits = 0;
+            if (h && is_mic(h, upkg_main_export(h)))
+                for (int k = 0; k < h->nimp && !fits; k++) fits = !_stricmp(upkg_name_at(h, h->imp[k].name), parent);
+            upkg_free(h);
+            if (fits) {
+                upkg *g = NULL;
+                sr_jmp = &j;
+                if (!setjmp(j)) g = game_pkg_load(a, l.v[i], 1);
+                sr_jmp = outer;
+                const char *gpar = g ? mat_parent(g, upkg_main_export(g)) : NULL;
+                if (gpar && !_stricmp(gpar, parent)) {
+                    int sc = donor_score(u, g, path, l.v[i]);
+                    if (sc > best_score) { free(best); best = xstrdup(l.v[i]); best_score = sc; }
+                }
+                upkg_free(g);
+            }
+            free(l.v[i]);
+        }
+        free(l.v);
+        free(prev);
+        prev = xstrdup(dir);
+        sl[0] = 0;                                              // one folder up
+    }
+    free(dir); free(prev);
+    return best;
+}
+
+// the mod's material m rebuilt from game material `donor`: the donor's current data (switches, compiled shaders)
+// under the mod's name, its textures pointed at the mod's and the mod's scalar and vector values put in. NULL (and
+// logged unless quiet) if the two don't fit together.
+static upkg *refresh_material(ctx *c, int m, const char *donor, int quiet)
+{
+    analysis *a = c->a;
+    const char *path = a->pkgs[m].game;
+    upkg *u = mod_pkg_load(a, m), *g = game_pkg_load(a, donor, 1);
+    if (!g) sr_fail("the game's %s could not be read", donor);
+    int eu = upkg_main_export(u), eg = upkg_main_export(g);
+    static mparam pu[MAXP], pg[MAXP];
+    rename_map rm = {0};
+    char why[256] = "";
+    // textures: the donor's texture for each parameter becomes the mod's
+    int nu = mat_params(u, eu, "TextureParameterValues", pu, MAXP), ng = mat_params(g, eg, "TextureParameterValues", pg, MAXP);
+    for (int i = 0; i < nu && !why[0]; i++)
+        if (!param_named(pg, ng, pu[i].name))
+            snprintf(why, sizeof why, "the mod sets texture %s, which the game's material doesn't", pu[i].name);
+    for (int i = 0; i < ng && !why[0]; i++) {
+        const mparam *q = param_named(pu, nu, pg[i].name);
+        if (!q || strcmp(pg[i].type, "ObjectProperty") || strcmp(q->type, "ObjectProperty")) continue;
+        const char *tg = upkg_import_package(g, (int32_t)rd32(g->ue + pg[i].val));
+        const char *tu = upkg_import_package(u, (int32_t)rd32(u->ue + q->val));
+        if (!tg || !tu) {
+            if (!tg != !tu) snprintf(why, sizeof why, "texture %s is set in only one of them", pg[i].name);
+            continue;
+        }
+        if (!_stricmp(tg, tu)) continue;
+        const char *was = rmap_get(&rm, tg);
+        if (was && _stricmp(was, tu))
+            snprintf(why, sizeof why, "the game's material uses %s for two textures the mod sets differently", upkg_short(tg));
+        else if (!was) rmap_add(&rm, tg, tu);
+    }
+    // scalar and vector values
+    int lost = 0;
+    static const char *arrays[] = {"ScalarParameterValues", "VectorParameterValues"};
+    for (int k = 0; k < 2 && !why[0]; k++) {
+        nu = mat_params(u, eu, arrays[k], pu, MAXP);
+        ng = mat_params(g, eg, arrays[k], pg, MAXP);
+        for (int i = 0; i < nu; i++) {
+            const mparam *q = param_named(pg, ng, pu[i].name);
+            if (q && q->size == pu[i].size && !strcmp(q->type, pu[i].type)) memcpy(g->ue + q->val, u->ue + pu[i].val, (size_t)q->size);
+            else lost++;
+        }
+    }
+    if (why[0]) {
+        if (!quiet) log_msg("  it can't be rebuilt from %s: %s", upkg_short(donor), why);
+        for (int i = 0; i < rm.n; i++) { free(rm.from[i]); free(rm.to[i]); }
+        free(rm.from); free(rm.to);
+        upkg_free(u); upkg_free(g);
+        return NULL;
+    }
+    if (!quiet) {
+        nu = mat_params(u, eu, "StaticSwitchParameters", pu, MAXP);
+        ng = mat_params(g, eg, "StaticSwitchParameters", pg, MAXP);
+        for (int i = 0; i < ng; i++) {
+            const mparam *q = param_named(pu, nu, pg[i].name);
+            if (!q || q->override != pg[i].override || u->ue[q->val] != g->ue[pg[i].val])
+                log_msg("  switch %s now as in the game's material (%s)", pg[i].name, g->ue[pg[i].val] ? "on" : "off");
+        }
+        if (lost) log_msg("  %d of the mod's values have no place in the game's material and are left out", lost);
+    }
+    if (_stricmp(donor, path)) rmap_add(&rm, donor, path);
+    upkg_rename(g, &rm, donor, path);
+    for (int i = 0; i < rm.n; i++) { free(rm.from[i]); free(rm.to[i]); }
+    free(rm.from); free(rm.to);
+    upkg_free(u);
+    return g;
+}
+
+// find the mod's outdated materials and what to rebuild them from; how many will be rebuilt
+static int check_materials(ctx *c)
+{
+    analysis *a = c->a;
+    shader_lib lib = {0};
+    int fixed = 0;
+    for (int m = 0; m < a->npkgs; m++) {
+        mod_pkg *mp = &a->pkgs[m];
+        if (mp->fu < 0 || mp->fe < 0 || !mp->cls || strcmp(mp->cls, "MaterialInstanceConstant")) continue;
+        upkg *u = NULL;
+        jmp_buf j, *outer = sr_jmp;
+        sr_jmp = &j;
+        if (!setjmp(j)) u = mod_pkg_load(a, m);
+        sr_jmp = outer;
+        if (!u) continue;
+        ptag t;
+        int e = upkg_main_export(u);
+        int own = e >= 0 && prop_find(u, e, "bHasStaticPermutationResource", &t) && t.bool_at && u->ue[t.bool_at];
+        if (!own || !lib_load(a, &lib) || lib_knows(&lib, u->ue, u->ue_n)) { upkg_free(u); continue; }
+        log_msg("%s was made for an older version of the game: its compiled shaders are gone, so it would look grey",
+                upkg_short(mp->game));
+        char *donor = find_donor(a, u, mp->game, mp->override);
+        upkg_free(u);
+        if (!donor) { log_msg("  no game material to rebuild it from was found: it stays as it is"); continue; }
+        upkg *r = refresh_material(c, m, donor, 0);
+        if (!r) { free(donor); continue; }
+        upkg_free(r);
+        log_msg("  rebuilt from the game's %s, with the mod's textures and values", upkg_short(donor));
+        mp->shader_donor = donor;
+        fixed++;
+    }
+    free(lib.h);
+    return fixed;
+}
+
 // name of the patched pak: <name>_patched_P.pak for <name>_P.pak. UE4 mounts paks ending in _P (after an optional
 // chunk version, <name>_<N>_P) with a higher priority, so that ending stays as it is, and so does the load order.
 static wchar_t *patched_path(const wchar_t *orig)
@@ -707,22 +1089,24 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *const *addons, int
     }
 
     list_ctx outfits = {NULL, 0, "/TacticalOutfits/", "TacticalOutfit_"}, palettes = {NULL, 0, "/Palettes/", "HeroSkinPalette_"};
+    list_ctx abbey = {NULL, 0, "/Items/AbbeyOutfits/", "AbbeyOutfit_"};   // the clothes heroes wear in the Abbey
     game_each(a->game, list_items, &outfits);
     game_each(a->game, list_items, &palettes);
+    game_each(a->game, list_items, &abbey);
     // only items the game really has (registered); others are leftovers the game never shows
     {
-        int n = outfits.n + palettes.n, *ok = xcalloc(n + 1, sizeof(int));
+        list_ctx *ls[] = {&outfits, &palettes, &abbey};
+        int n = outfits.n + palettes.n + abbey.n, *ok = xcalloc(n + 1, sizeof(int));
         char **all = xmalloc(sizeof(char *) * (n + 1));
-        memcpy(all, outfits.v, sizeof(char *) * outfits.n);
-        memcpy(all + outfits.n, palettes.v, sizeof(char *) * palettes.n);
+        for (int q = 0, at = 0; q < 3; at += ls[q]->n, q++) memcpy(all + at, ls[q]->v, sizeof(char *) * ls[q]->n);
         log_msg("reading the game's registries...");
         check_registered(a, all, n, ok, 0);
-        int k = 0, dropped = 0;
-        for (int i = 0; i < outfits.n; i++) if (ok[i]) outfits.v[k++] = outfits.v[i]; else { free(outfits.v[i]); dropped++; }
-        outfits.n = k;
-        k = 0;
-        for (int i = 0; i < palettes.n; i++) if (ok[outfits.n + dropped + i]) palettes.v[k++] = palettes.v[i]; else free(palettes.v[i]);
-        palettes.n = k;
+        for (int q = 0, at = 0; q < 3; q++) {
+            int k = 0;
+            for (int i = 0; i < ls[q]->n; i++) if (ok[at + i]) ls[q]->v[k++] = ls[q]->v[i]; else free(ls[q]->v[i]);
+            at += ls[q]->n;
+            ls[q]->n = k;
+        }
         free(all); free(ok);
     }
 
@@ -770,50 +1154,101 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *const *addons, int
                 if (a->pkgs[m].override && !a->pkgs[m].src == !pass) smap_put(&gr.sidx, a->pkgs[m].game, ns++);
         gr.words = (ns + 63) / 64;
         log_msg("looking for the suit that uses the %d changed game files...", noverride);
-        int best = -1, best_n = 0;
-        for (int i = 0; i < outfits.n; i++) {
-            int id = node_of(&gr, outfits.v[i]);
-            reach(&gr, id, 1);
-            int cnt = bits_count_upto(gr.v[id].bits, noverride);
-            if (!cnt) continue;
-            // more changed files wins; then the base game over DLC, then the shorter name
-            int better = cnt > best_n;
-            if (cnt == best_n && best >= 0) {
-                const char *x = outfits.v[i], *y = outfits.v[best];
-                int bx = !strncmp(x, "/Game/Coda/", 11), by = !strncmp(y, "/Game/Coda/", 11);
-                better = bx != by ? bx > by : strlen(x) < strlen(y);
+        // battle suits; Abbey outfits only when no battle suit uses any of the changed files (an Abbey outfit can
+        // wear parts of the hero's suit, e.g. Dr Strange's cape)
+        list_ctx *cand[2] = {&outfits, &abbey};
+        int best = -1, best_n = 0, best_q = 0;
+        for (int q = 0; q < 2 && best < 0; q++)
+            for (int i = 0; i < cand[q]->n; i++) {
+                int id = node_of(&gr, cand[q]->v[i]);
+                reach(&gr, id, 1);
+                int cnt = bits_count_upto(gr.v[id].bits, noverride);
+                if (!cnt) continue;
+                // more changed files wins; then the base game over DLC, then the shorter name
+                int better = cnt > best_n;
+                if (cnt == best_n && best >= 0 && q == best_q) {
+                    const char *x = cand[q]->v[i], *y = cand[q]->v[best];
+                    int bx = !strncmp(x, "/Game/Coda/", 11), by = !strncmp(y, "/Game/Coda/", 11);
+                    better = bx != by ? bx > by : strlen(x) < strlen(y);
+                }
+                if (better) { best = i; best_n = cnt; best_q = q; }
             }
-            if (better) { best = i; best_n = cnt; }
-        }
         log_msg("(%d packages looked at)", gr.reads);
-        if (best < 0) sr_fail("none of the game's suits uses the files this mod changes, so there is no suit to copy");
-        for (int i = 0; i < outfits.n; i++) {
-            int id = smap_get(&gr.ids, outfits.v[i]);
+        if (best < 0)
+            sr_fail("none of the game's suits or Abbey outfits uses the files this mod changes, so there is nothing to copy");
+        list_ctx *won = cand[best_q];
+        for (int i = 0; i < won->n; i++) {
+            int id = smap_get(&gr.ids, won->v[i]);
             if (i != best && id >= 0 && bits_count_upto(gr.v[id].bits, noverride) == best_n)
-                log_msg("note: %s uses the same files; using %s", upkg_short(outfits.v[i]), upkg_short(outfits.v[best]));
+                log_msg("note: %s uses the same files; using %s", upkg_short(won->v[i]), upkg_short(won->v[best]));
         }
-        a->outfit = xstrdup(outfits.v[best]);
-        // its palettes: the game palettes listing this outfit as compatible
-        char *op = obj_path(a->outfit);
-        for (int i = 0; i < palettes.n; i++) {
-            upkg *u = NULL;
-            jmp_buf j, *outer = sr_jmp;
-            sr_jmp = &j;
-            if (!setjmp(j)) u = load_pkg(&c, palettes.v[i], 0, NULL);
-            sr_jmp = outer;
-            if (!u) continue;
-            int uses = upkg_find_name(u, op) >= 0;
-            upkg_free(u);
-            if (uses) { pals = xrealloc(pals, sizeof(char *) * (npal + 1)); pals[npal++] = xstrdup(palettes.v[i]); }
+        a->outfit = xstrdup(won->v[best]);
+        a->abbey = best_q;
+        // a look made of pieces in several categories (the Hunter: a suit, and a head prop such as a helmet): the
+        // hero's items of other categories that use the changed files the outfit doesn't come along as pieces
+        if (!a->abbey) {
+            uint64_t *covered = xcalloc(gr.words, sizeof(uint64_t));
+            memcpy(covered, gr.v[smap_get(&gr.ids, a->outfit)].bits, sizeof(uint64_t) * gr.words);
+            char *cats[1 + MAX_PIECES] = {outfit_category(&c, a->outfit)};
+            char hero[16];
+            snprintf(hero, sizeof hero, "%s", ref_hero(a->outfit));
+            while (a->npieces < MAX_PIECES && hero[0]) {
+                int pick = -1, pick_n = 0;
+                char *pick_cat = NULL;
+                for (int i = 0; i < outfits.n; i++) {
+                    int id = smap_get(&gr.ids, outfits.v[i]);
+                    if (id < 0 || strcmp(ref_hero(outfits.v[i]), hero)) continue;
+                    int n = 0;
+                    for (int s = 0; s < noverride; s++)
+                        n += (int)(gr.v[id].bits[s / 64] >> (s % 64) & 1) & !(int)(covered[s / 64] >> (s % 64) & 1);
+                    if (n < pick_n || !n || (n == pick_n && strlen(outfits.v[i]) >= strlen(outfits.v[pick]))) continue;
+                    char *cat = outfit_category(&c, outfits.v[i]);
+                    int dup = 0;
+                    for (int k = 0; k <= a->npieces; k++) dup |= !_stricmp(cats[k], cat);
+                    if (dup) { free(cat); continue; }
+                    free(pick_cat);
+                    pick = i; pick_n = n; pick_cat = cat;
+                }
+                if (pick < 0) break;
+                a->piece[a->npieces] = xstrdup(outfits.v[pick]);
+                cats[++a->npieces] = pick_cat;
+                int id = smap_get(&gr.ids, outfits.v[pick]);
+                for (int w = 0; w < gr.words; w++) covered[w] |= gr.v[id].bits[w];
+                log_msg("the look has another piece that uses %d more of the changed files: %s, copied with the suit",
+                        pick_n, upkg_short(outfits.v[pick]));
+            }
+            for (int k = 0; k <= a->npieces; k++) free(cats[k]);
+            free(covered);
         }
-        free(op);
+        // its palettes: the game palettes listing this outfit (or a piece) as compatible (an Abbey outfit has none to
+        // choose from: it lists the palettes it always wears, and those that lead to changed files are copied with it)
+        for (int k = 0; k <= a->npieces && !a->abbey; k++) {
+            char *op = obj_path(k ? a->piece[k - 1] : a->outfit);
+            for (int i = 0; i < palettes.n; i++) {
+                int have = 0;
+                for (int q = 0; q < npal; q++) have |= !_stricmp(pals[q], palettes.v[i]);
+                if (have) continue;
+                upkg *u = NULL;
+                jmp_buf j, *outer = sr_jmp;
+                sr_jmp = &j;
+                if (!setjmp(j)) u = load_pkg(&c, palettes.v[i], 0, NULL);
+                sr_jmp = outer;
+                if (!u) continue;
+                int uses = upkg_find_name(u, op) >= 0;
+                upkg_free(u);
+                if (uses) { pals = xrealloc(pals, sizeof(char *) * (npal + 1)); pals[npal++] = xstrdup(palettes.v[i]); }
+            }
+            free(op);
+        }
         qsort(pals, npal, sizeof *pals, cmp_str);
-        // what gets cloned: the outfit, its palettes, and everything from them that leads to a changed file
+        // what gets cloned: the outfit (and its pieces), its palettes, and everything from them that leads to a
+        // changed file
         smap seen = {0};
         char **cl = NULL;
         int ncl = 0;
         int oid = smap_get(&gr.ids, a->outfit);
         collect(&gr, oid, &seen, &cl, &ncl);
+        for (int k = 0; k < a->npieces; k++) collect(&gr, smap_get(&gr.ids, a->piece[k]), &seen, &cl, &ncl);
         for (int i = 0; i < npal; i++) {
             int id = node_of(&gr, pals[i]);
             reach(&gr, id, 1);
@@ -822,7 +1257,8 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *const *addons, int
         // a suit without a head or hair of its own wears the hero's default ones (HeadMesh / HairMesh of the battle
         // look, TacticalPawnConfig: on the character template, or on its blueprint class when the template keeps the
         // class default). When the mod or an add-on changes one of them, the new suit gets a copy as its own.
-        {
+        // (Not for an Abbey outfit: the Abbey look's head is the hero's, and changes to it stay as they are.)
+        if (!a->abbey) {
             upkg *u = load_pkg(&c, a->outfit, 1, NULL);
             int ue = upkg_main_export(u);
             ptag t;
@@ -832,7 +1268,8 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *const *addons, int
             char **refs = upkg_refs(u, &nr), *chr = NULL;
             upkg_free(u);
             for (int i = 0; i < nr; i++) {
-                if (!chr && strstr(refs[i], "/Templates/Characters/Heroes/")) chr = refs[i];
+                // (Heroes/, or Heros/ as in DLC_Deadpool)
+                if (!chr && strstr(refs[i], "/Templates/Characters/Hero")) chr = refs[i];
                 else free(refs[i]);
             }
             free(refs);
@@ -876,6 +1313,7 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *const *addons, int
         }
         smap_free(&seen);
         add_item(a, a->outfit, smap_get(&c.mods, a->outfit), K_OUTFIT, 1);
+        for (int k = 0; k < a->npieces; k++) add_item(a, a->piece[k], smap_get(&c.mods, a->piece[k]), K_OUTFIT, 1);
         for (int i = 0; i < npal; i++) add_item(a, pals[i], smap_get(&c.mods, pals[i]), K_PALETTE, 1);
         for (int i = 0; i < ncl; i++) {
             char *gp = game_to_pak(cl[i], ".uasset");
@@ -894,16 +1332,20 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *const *addons, int
             free(paths); free(ok);
         }
         for (int i = 0; i < a->nitems; i++) if (a->items[i].mod >= 0) a->pkgs[a->items[i].mod].in_clone = 1;
+        if (!a->abbey) hero_palette_slots(&c);
+        leave_out_ui(a);
         int left = 0;
         for (int m = 0; m < a->npkgs; m++)
-            if (a->pkgs[m].override && !a->pkgs[m].in_clone) {
+            if (a->pkgs[m].override && !a->pkgs[m].in_clone && !a->pkgs[m].left_out) {
                 if (!left++) log_msg("these changed files are not part of the suit and stay as they are (they still change the game's own files):");
                 log_msg("  %s", a->pkgs[m].game);
             }
         for (int k = 0; k < a->naddons; k++) {
             int used = 0, global = 0;
             for (int m = 0; m < a->npkgs; m++)
-                if (a->pkgs[m].src == k + 1 && a->pkgs[m].override) { if (a->pkgs[m].in_clone) used++; else global++; }
+                if (a->pkgs[m].src == k + 1 && a->pkgs[m].override && !a->pkgs[m].left_out) {
+                    if (a->pkgs[m].in_clone) used++; else global++;
+                }
             log_msg("add-on %d (%s): %d changed file%s now belong%s to the new suit only%s", k + 1, a->addon_name[k], used,
                     used == 1 ? "" : "s", used == 1 ? "s" : "", global ? "; the others still change the game's own files (listed above)" : "");
         }
@@ -912,13 +1354,15 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *const *addons, int
         smap_free(&gr.ids);
         smap_free(&gr.sidx);
     }
+    if (a->mode == MODE_STANDALONE) leave_out_ui(a);
     if (a->mode == MODE_STANDALONE)
         for (int k = 0; k < a->naddons; k++)
             log_msg("add-on %d (%s): included as it is (with a new suit, add-ons still change the game's own files)", k + 1,
                     a->addon_name[k]);
     for (int i = 0; i < outfits.n; i++) free(outfits.v[i]);
     for (int i = 0; i < palettes.n; i++) free(palettes.v[i]);
-    free(outfits.v); free(palettes.v);
+    for (int i = 0; i < abbey.n; i++) free(abbey.v[i]);
+    free(outfits.v); free(palettes.v); free(abbey.v);
 
     snprintf(a->hero, sizeof a->hero, "%s", ref_hero(a->outfit));
     {
@@ -926,25 +1370,40 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *const *addons, int
         a->outfit_name = prop_get_text(u, upkg_main_export(u), "ItemName");
         upkg_free(u);
     }
+    // the hero's name: the folder of its palettes (or Abbey outfits), which is the name without spaces
+    // (CaptainAmerica, IronMan); else the hero code of the outfit
+    const char *folder = NULL;
+    for (int i = 0; i < npal && !folder; i++)
+        if ((folder = strstr(pals[i], "/Palettes/"))) folder += 10;
+    if (!folder && a->abbey && (folder = strstr(a->outfit, "/AbbeyOutfits/"))) folder += 14;
     char hero_name[64] = "";
-    for (int i = 0; i < npal && !hero_name[0]; i++) {
-        const char *q = strstr(pals[i], "/Palettes/");
-        if (!q) continue;
-        q += 10;
-        size_t n = strcspn(q, "/");
-        if (n && n < sizeof hero_name && q[n] == '/') { memcpy(hero_name, q, n); hero_name[n] = 0; }
+    size_t fn = folder ? strcspn(folder, "/") : 0;
+    for (size_t i = 0, k = 0; fn && fn < sizeof hero_name / 2 && folder[fn] == '/' && i < fn; i++) {
+        if (i && isupper((uint8_t)folder[i]) && islower((uint8_t)folder[i - 1])) hero_name[k++] = ' ';
+        hero_name[k++] = folder[i];
+        hero_name[k] = 0;
     }
-    if (!hero_name[0]) snprintf(hero_name, sizeof hero_name, "%s", a->hero[0] ? a->hero : "a hero");
+    if (!hero_name[0])
+        snprintf(hero_name, sizeof hero_name, "%s", !strcmp(a->hero, "HNTR") ? "the Hunter" : a->hero[0] ? a->hero : "a hero");
+    char pieces[256] = "";
+    for (int k = 0, o = 0; k < a->npieces && o < (int)sizeof pieces - 80; k++)
+        o += snprintf(pieces + o, sizeof pieces - o, "%s%s", k ? ", " : " together with ", upkg_short(a->piece[k]));
     describe_palettes(&c, pals, npal);
     if (npal > MAX_PALETTES) log_msg("note: %d palettes; the last %d are named automatically", npal, npal - MAX_PALETTES);
     for (int i = 0; i < npal; i++) free(pals[i]);
     free(pals);
 
-    if (a->mode == MODE_REPLACER)
+    if (a->mode == MODE_REPLACER && a->abbey)
         snprintf(a->summary, sizeof a->summary,
-                 "This mod changes %s's \"%s\" suit (%s). Patching makes it a new suit of its own with %d palette%s; "
+                 "This mod changes %s's \"%s\" Abbey outfit (%s). Patching makes it a new Abbey outfit of its own; the "
+                 "original outfit goes back to normal. %d file%s will be copied under new names.",
+                 hero_name, a->outfit_name ? a->outfit_name : "?", upkg_short(a->outfit), a->nitems,
+                 a->nitems == 1 ? "" : "s");
+    else if (a->mode == MODE_REPLACER)
+        snprintf(a->summary, sizeof a->summary,
+                 "This mod changes %s's \"%s\" suit (%s%s). Patching makes it a new suit of its own with %d palette%s; "
                  "the original suit goes back to normal. %d file%s will be copied under new names.",
-                 hero_name, a->outfit_name ? a->outfit_name : "?", upkg_short(a->outfit), npal,
+                 hero_name, a->outfit_name ? a->outfit_name : "?", upkg_short(a->outfit), pieces, npal,
                  npal == 1 ? "" : "s", a->nitems, a->nitems == 1 ? "" : "s");
     else
         snprintf(a->summary, sizeof a->summary,
@@ -956,6 +1415,7 @@ analysis *analyze_pak(const wchar_t *pak_path, const wchar_t *const *addons, int
         snprintf(a->summary + sl, sizeof a->summary - sl, " %d add-on%s merged in.", a->naddons,
                  a->naddons == 1 ? "" : "s");
     }
+    check_materials(&c);                                        // (the log tells which materials are updated)
     log_msg("%s", a->summary);
     for (int i = 0; i < a->nitems; i++)
         log_msg("  %-8s %s%s", a->items[i].kind == K_OUTFIT ? "outfit" : a->items[i].kind == K_PALETTE ? "palette" : "file",
@@ -969,7 +1429,9 @@ void analysis_free(analysis *a)
     if (!a) return;
     for (int i = 0; i < a->nfiles; i++) { free(a->files[i].path); free(a->files[i].e.blocks); }
     free(a->files);
-    for (int i = 0; i < a->npkgs; i++) { free(a->pkgs[i].game); free(a->pkgs[i].prefix); free(a->pkgs[i].cls); }
+    for (int i = 0; i < a->npkgs; i++) {
+        free(a->pkgs[i].game); free(a->pkgs[i].prefix); free(a->pkgs[i].cls); free(a->pkgs[i].shader_donor);
+    }
     free(a->pkgs);
     for (int i = 0; i < a->nitems; i++) { free(a->items[i].game); free(a->items[i].donor); }
     free(a->items);
@@ -983,6 +1445,9 @@ void analysis_free(analysis *a)
     free(a->pak_path); free(a->orig_path); free(a->out_path); free(a->stale_path); free(a->paks_dir);
     free(a->outfit); free(a->outfit_name); free(a->source_name);
     for (int s = 0; s < NLOOKS; s++) free(a->look[s]);
+    for (int k = 0; k < a->npieces; k++) free(a->piece[k]);
+    for (int k = 0; k < a->nslots; k++) free(a->slots[k]);
+    free(a->slots);
     free(a);
 }
 
@@ -1086,6 +1551,8 @@ static char *with_ext(const char *pak_base, const char *ext)
 // pak path (without extension) of a /Game path, with the mod's own "<Project>/Content/" prefix
 static char *pak_base(const char *prefix, const char *game)
 {
+    // (a plugin's packages, /DLC_X/..., always go in the game's own CodaGame/Plugins/DLC_X/Content/)
+    if (strncmp(game, "/Game/", 6)) return game_to_pak(game, "");
     char *s = xmalloc(strlen(prefix) + strlen(game) + 1);
     sprintf(s, "%s%s", prefix, game + 6);
     return s;
@@ -1135,7 +1602,7 @@ patch_result run_patch(analysis *a, const patch_options *o)
     if (!o->name || !*o->name) sr_fail("the suit needs a name");
     if (o->rarity < 0 || o->rarity > 3) sr_fail("bad rarity");
     if (game_running()) sr_fail("Midnight Suns is running - close the game first");
-    ctx c = {a, {0}};
+    ctx c = {a, {0}, 1};
     for (int m = 0; m < a->npkgs; m++) smap_put(&c.mods, a->pkgs[m].game, m);
 
     // the tag in the new package names, unique in the game and the mod
@@ -1162,8 +1629,21 @@ patch_result run_patch(analysis *a, const patch_options *o)
             rmap_add(&m, a->items[i].game, np);
             free(np);
         }
+    // the copied files other than the outfit and palettes: the mod's changed files the suit doesn't use (e.g. a mask
+    // or a hologram mesh) are pointed at these copies, since the originals they used go back to the game's own
+    rename_map others = {0};
+    for (int i = 0; i < a->nitems; i++)
+        if (a->items[i].rename && a->items[i].kind == K_OTHER) rmap_add(&others, a->items[i].game, rmap_get(&m, a->items[i].game));
     const char *new_outfit = a->mode == MODE_REPLACER ? rmap_get(&m, a->outfit) : a->outfit;
+    // the palettes are listed only for the new outfit (and its pieces): "<obj>|<obj>..."
     char *new_outfit_obj = obj_path(new_outfit);
+    for (int k = 0; k < a->npieces; k++) {
+        char *po = obj_path(rmap_get(&m, a->piece[k]));
+        char *both = xmalloc(strlen(new_outfit_obj) + strlen(po) + 2);
+        sprintf(both, "%s|%s", new_outfit_obj, po);
+        free(new_outfit_obj); free(po);
+        new_outfit_obj = both;
+    }
     snprintf(res.id, sizeof res.id, "%s%s%s", a->hero, a->hero[0] ? "_" : "", tag);
     log_msg("patching: \"%s\", rarity %d, id %s", o->name, o->rarity, res.id);
 
@@ -1204,7 +1684,7 @@ patch_result run_patch(analysis *a, const patch_options *o)
     if (!w) sr_fail("could not create %ls (error %lu)", tmp, GetLastError());
     jmp_buf j, *outer = sr_jmp;
     sr_jmp = &j;
-    if (setjmp(j)) { sr_jmp = outer; DeleteFileW(tmp); free(tmp); longjmp(*outer, 1); }
+    if (setjmp(j)) { sr_jmp = outer; pak_write_abort(w); DeleteFileW(tmp); free(tmp); longjmp(*outer, 1); }
     int nout = 0;
     // 1. the mod's own files (except the cloned packages): new packages get their references updated
     for (int i = 0; i < a->nfiles; i++) {
@@ -1217,10 +1697,20 @@ patch_result run_patch(analysis *a, const patch_options *o)
         if (mp && (mp->in_clone || (item >= 0 && a->items[item].rename))) continue;   // written as a clone below
         int is_header = mp && i == mp->fu;
         if (mp && (i == mp->fe) && mp->fu >= 0) continue;       // written with its .uasset
-        if (is_header && (m.n || item >= 0) && !mp->override) {
-            upkg *u = load_pkg(&c, mp->game, 1, NULL);
-            upkg_rename(u, &m, NULL, NULL);
-            if (item >= 0) {
+        // (an outdated material comes rebuilt; one that overrides the game's stays under its name, as all overrides)
+        if (is_header && (((m.n || item >= 0) && !mp->override) || mp->shader_donor)) {
+            // (a stray file that isn't a whole package, e.g. "X - Copy.uasset" without its .uexp, goes in as it is)
+            upkg *u = NULL;
+            jmp_buf pj, *pouter = sr_jmp;
+            sr_jmp = &pj;
+            if (!setjmp(pj)) u = load_pkg(&c, mp->game, 1, NULL);
+            sr_jmp = pouter;
+            if (!u) {
+                log_msg("note: %s could not be read (%s); it goes in unchanged", f->path, sr_error);
+                goto raw;
+            }
+            if (!mp->override) upkg_rename(u, &m, NULL, NULL);
+            if (item >= 0 && !mp->override) {
                 const char *display = a->items[item].kind == K_OUTFIT ? o->name : NULL;
                 if (a->items[item].kind == K_PALETTE)
                     for (int q = 0; q < npal_items; q++) if (!_stricmp(pal_pkg[q], mp->game)) display = pal_name[q];
@@ -1233,6 +1723,27 @@ patch_result run_patch(analysis *a, const patch_options *o)
             nout += 2;
             continue;
         }
+        if (is_header && mp->override && item < 0 && others.n) {
+            upkg *u = load_pkg(&c, mp->game, 0, NULL);
+            int nr, uses = 0;
+            char **refs = upkg_refs(u, &nr);
+            upkg_free(u);
+            for (int k = 0; k < nr; k++) { uses += rmap_get(&others, refs[k]) != NULL; free(refs[k]); }
+            free(refs);
+            if (uses) {
+                log_msg("  %s (changed by the mod, not part of the suit) now uses the new suit's copies of %d file%s",
+                        upkg_short(mp->game), uses, uses == 1 ? "" : "s");
+                u = load_pkg(&c, mp->game, 1, NULL);
+                upkg_rename(u, &others, NULL, NULL);
+                char *base = pak_base(mp->prefix, mp->game);
+                write_pkg(w, u, base);
+                free(base);
+                upkg_free(u);
+                nout += 2;
+                continue;
+            }
+        }
+    raw:;
         size_t n;
         uint8_t *d = mod_read(a, i, &n);
         pak_write_file(w, f->path, d, n, f->e.method != 0 && !ends_with(f->path, ".ubulk"));
@@ -1254,11 +1765,18 @@ patch_result run_patch(analysis *a, const patch_options *o)
         upkg *u = load_pkg(&c, it->game, 1, &from_mod);
         if (!u) sr_fail("%s could not be read", it->game);
         upkg_rename(u, &m, it->game, np);
+        for (int s = 0; s < a->nslots; s++)                     // the slots the hero's palettes would repaint
+            for (int q = 0; q < u->nnames; q++) {
+                if (_stricmp(u->names[q].s, a->slots[s])) continue;
+                char sn[160];
+                snprintf(sn, sizeof sn, "%s_%s", u->names[q].s, tag);
+                upkg_set_name(u, q, sn);
+            }
         if (it->kind != K_OTHER) {
             const char *display = o->name;
             for (int q = 0; q < npal_items; q++) if (!_stricmp(pal_pkg[q], it->game)) display = pal_name[q];
             apply_item_edits(u, it, tag, display, o->rarity, new_outfit_obj, np);
-            for (int s = 0; s < NLOOKS && it->kind == K_OUTFIT; s++) {
+            for (int s = 0; s < NLOOKS && it->kind == K_OUTFIT && !_stricmp(it->game, a->outfit); s++) {
                 if (!a->look[s]) continue;
                 char *lop = obj_path(rmap_get(&m, a->look[s]));
                 prop_set_softpath(u, upkg_main_export(u), LOOK_PROP[s], lop);
@@ -1417,6 +1935,8 @@ patch_result run_patch(analysis *a, const patch_options *o)
     free(pal_name); free(pal_pkg); free(tmp); free(new_outfit_obj);
     for (int i = 0; i < m.n; i++) { free(m.from[i]); free(m.to[i]); }
     free(m.from); free(m.to);
+    for (int i = 0; i < others.n; i++) { free(others.from[i]); free(others.to[i]); }
+    free(others.from); free(others.to);
     smap_free(&c.mods);
     return res;
 }

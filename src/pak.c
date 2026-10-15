@@ -281,15 +281,17 @@ void pak_entries_free(pak_entry *e, int count)
     free(e);
 }
 
-uint8_t *pak_read(pak *pk, pak_entry *e, int allow_oodle)
+// the first `want` bytes of a file (all of it if want >= usize)
+static uint8_t *read_upto(pak *pk, pak_entry *e, int64_t want, int allow_oodle)
 {
-    if (e->usize < 0 || e->usize > 0x7fff0000) sr_fail("%s: too large", e->path);
+    if (want > e->usize) want = e->usize;
+    if (want < 0 || want > 0x7fff0000) sr_fail("%s: too large", e->path);
     if (e->encrypted && !allow_aes_flag) sr_fail("%s is encrypted", e->path);
     const char *name = pk->methods[e->method];
-    uint8_t *out = xmalloc((size_t)e->usize + 1);
+    uint8_t *out = xmalloc((size_t)want + 1);
     if (!e->method) {
-        uint8_t *p = read_maybe_encrypted(pk, e->blocks[0], e->size, e->encrypted);
-        memcpy(out, p, (size_t)e->usize);
+        uint8_t *p = read_maybe_encrypted(pk, e->blocks[0], want, e->encrypted);
+        memcpy(out, p, (size_t)want);
         free(p);
         return out;
     }
@@ -297,19 +299,28 @@ uint8_t *pak_read(pak *pk, pak_entry *e, int allow_oodle)
     if (!oodle && strcmp(name, "Zlib")) sr_fail("%s: compression %s is not supported", e->path, name);
     if (oodle && (!allow_oodle || !oodle_load(0))) sr_fail("%s needs Oodle", e->path);
     uint32_t bs = e->block_size ? e->block_size : (uint32_t)e->usize;
-    for (int i = 0; i < e->nblocks; i++) {
+    uint8_t *blk = want < e->usize ? xmalloc(bs) : NULL;       // the last block, when only part of it is wanted
+    for (int i = 0; i < e->nblocks && (int64_t)i * bs < want; i++) {
         int64_t s = e->blocks[2 * i], end = e->blocks[2 * i + 1];
         uint8_t *c = read_maybe_encrypted(pk, s, end - s, e->encrypted);
         int64_t uoff = (int64_t)i * bs;
         if (uoff >= e->usize) sr_fail("%s: bad compression blocks", e->path);
         size_t ulen = (size_t)((e->usize - uoff) < bs ? (e->usize - uoff) : bs);
-        int bad = oodle ? oodle_decompress(c, (size_t)(end - s), out + uoff, ulen)
-                        : inflate_zlib(c, (size_t)(end - s), out + uoff, ulen);
+        int part = uoff + (int64_t)ulen > want;
+        uint8_t *to = part ? blk : out + uoff;
+        int bad = oodle ? oodle_decompress(c, (size_t)(end - s), to, ulen)
+                        : inflate_zlib(c, (size_t)(end - s), to, ulen);
         free(c);
-        if (bad) sr_fail("%s: block %d could not be decompressed", e->path, i);
+        if (bad) { free(blk); sr_fail("%s: block %d could not be decompressed", e->path, i); }
+        if (part) memcpy(out + uoff, blk, (size_t)(want - uoff));
     }
+    free(blk);
     return out;
 }
+
+uint8_t *pak_read(pak *pk, pak_entry *e, int allow_oodle) { return read_upto(pk, e, e->usize, allow_oodle); }
+
+uint8_t *pak_read_head(pak *pk, pak_entry *e, int64_t n, int allow_oodle) { return read_upto(pk, e, n, allow_oodle); }
 
 // ================================================================ writer
 
@@ -545,5 +556,13 @@ void pak_write_end(pak_writer *w)
     for (int i = 0; i < w->n; i++) { free(w->e[i].path); free(w->e[i].bsizes); }
     free(w->e);
     if (!CloseHandle(w->h)) sr_fail("could not finish writing the registry pak");
+    free(w);
+}
+
+void pak_write_abort(pak_writer *w)
+{
+    for (int i = 0; i < w->n; i++) { free(w->e[i].path); free(w->e[i].bsizes); }
+    free(w->e);
+    CloseHandle(w->h);
     free(w);
 }

@@ -339,17 +339,26 @@ static int is_package_import(upkg *p, int i)
     return !strcmp(upkg_name_at(p, p->imp[i].class_name), "Package");
 }
 
+// "/Game/A/X..." or a plugin's "/DLC_Morbius/A/X...": length of the mount ("/Game/"), 0 if not a content path
+size_t upkg_mount_len(const char *s)
+{
+    if (s[0] != '/' || !strncmp(s, "/Script/", 8) || !strncmp(s, "/Engine/", 8) || !strncmp(s, "/Temp/", 6)) return 0;
+    size_t n = strcspn(s + 1, "/.: ");
+    return n && s[1 + n] == '/' ? n + 2 : 0;
+}
+
 char **upkg_refs(upkg *p, int *n)
 {
     char **v = NULL;
     int k = 0;
     for (int i = 0; i < p->nnames; i++) {
         const char *s = p->names[i].s;
-        if (strncmp(s, "/Game/", 6)) continue;
+        size_t ml = upkg_mount_len(s);
+        if (!ml) continue;
         char *t = xstrdup(s);
-        char *dot = strchr(t + 6, '.');
+        char *dot = strchr(t + ml, '.');
         if (dot) *dot = 0;
-        char *colon = strchr(t + 6, ':');
+        char *colon = strchr(t + ml, ':');
         if (colon) *colon = 0;
         int dup = 0;
         for (int j = 0; j < k && !dup; j++) dup = !_stricmp(v[j], t);
@@ -424,10 +433,10 @@ void upkg_rename(upkg *p, const rename_map *m, const char *self_old, const char 
                 p->exp[i].name = upkg_name(p, nn);
     }
     // full paths: "/Game/A/X" (package imports, soft package references) and "/Game/A/X.X" (soft object paths),
-    // also "/Game/A/X.X:Sub" style subobject paths
+    // also "/Game/A/X.X:Sub" style subobject paths (and the same under a plugin's mount, e.g. /DLC_Morbius/)
     for (int i = 0; i < p->nnames; i++) {
         const char *s = p->names[i].s;
-        if (strncmp(s, "/Game/", 6)) continue;
+        if (!upkg_mount_len(s)) continue;
         size_t pl = strcspn(s, ".:");
         char *pkg = xmalloc(pl + 1);
         memcpy(pkg, s, pl); pkg[pl] = 0;
@@ -719,6 +728,18 @@ int prop_get_guid(upkg *p, int e, const char *name, uint8_t g[16])
     return 1;
 }
 
+// 1 if s is one of the '|'-separated entries of list
+static int in_list(const char *s, const char *list)
+{
+    size_t n = strlen(s);
+    for (const char *q = list; *q;) {
+        size_t k = strcspn(q, "|");
+        if (k == n && !_strnicmp(q, s, n)) return 1;
+        q += k + (q[k] == '|');
+    }
+    return 0;
+}
+
 int prop_filter_softarray(upkg *p, int e, const char *name, const char *keep)
 {
     ptag t;
@@ -735,7 +756,7 @@ int prop_filter_softarray(upkg *p, int e, const char *name, const char *keep)
         const char *nm = fname_at(p, p->ue + r.at);
         r.at += 8;
         rd_skip_fstring(&r);
-        if (!_stricmp(nm, keep)) { buf_put(&b, p->ue + s, r.at - s); kept++; }
+        if (in_list(nm, keep)) { buf_put(&b, p->ue + s, r.at - s); kept++; }
     }
     if (kept == n) { buf_free(&b); return 0; }
     memcpy(b.p, &kept, 4);
@@ -764,4 +785,108 @@ int prop_get_colors(upkg *p, int e, const char *name, float (*rgba)[4], int max)
         r.at += 16;
     }
     return k;
+}
+
+// ---------------------------------------------------------------- material instances
+
+// an FName as text, with its number ("Name_2" is stored as "Name", 3)
+static void fname_full(upkg *p, const uint8_t *q, char *out, size_t n)
+{
+    uint32_t num = rd32(q + 4);
+    if (num) snprintf(out, n, "%s_%u", upkg_name_at(p, (int32_t)rd32(q)), num - 1);
+    else snprintf(out, n, "%s", upkg_name_at(p, (int32_t)rd32(q)));
+}
+
+// the elements of a struct array whose tag is t: parameter name (ParameterInfo.Name) and value of each
+static int params_of(upkg *p, int e, const ptag *t, mparam *out, int max)
+{
+    if (strcmp(t->type, "ArrayProperty") || !t->sub || strcmp(t->sub, "StructProperty")) return 0;
+    rd r = {p->ue, t->val + (size_t)t->size, t->val};
+    int32_t n = rd_i32(&r);
+    if (n <= 0) return 0;
+    ptag inner, x;
+    size_t at = r.at;
+    if (!tag_read(p, e, &at, &inner)) return 0;
+    at = inner.val;
+    int k = 0;
+    for (int32_t i = 0; i < n; i++) {
+        mparam m = {0};
+        while (tag_read(p, e, &at, &x)) {
+            if (!strcmp(x.name, "ParameterInfo") && !strcmp(x.type, "StructProperty")) {
+                size_t q = x.val;
+                ptag y;
+                while (tag_read(p, e, &q, &y))
+                    if (!strcmp(y.name, "Name") && !strcmp(y.type, "NameProperty") && y.size >= 8)
+                        fname_full(p, p->ue + y.val, m.name, sizeof m.name);
+            } else if (!strcmp(x.name, "ParameterValue") || !strcmp(x.name, "Value")) {
+                m.type = x.type;
+                m.val = !strcmp(x.type, "BoolProperty") ? x.bool_at : x.val;
+                m.size = !strcmp(x.type, "BoolProperty") ? 1 : x.size;
+            } else if (!strcmp(x.name, "bOverride") && !strcmp(x.type, "BoolProperty"))
+                m.override = p->ue[x.bool_at];
+        }
+        if (k < max && m.type) out[k++] = m;
+    }
+    return k;
+}
+
+int mat_params(upkg *p, int e, const char *array, mparam *out, int max)
+{
+    ptag t;
+    if (!strcmp(array, "StaticSwitchParameters")) {
+        if (!prop_find(p, e, "StaticParameters", &t) || strcmp(t.type, "StructProperty")) return 0;
+        size_t at = t.val;
+        ptag x;
+        while (tag_read(p, e, &at, &x))
+            if (!strcmp(x.name, array)) return params_of(p, e, &x, out, max);
+        return 0;
+    }
+    return prop_find(p, e, array, &t) ? params_of(p, e, &t, out, max) : 0;
+}
+
+int palette_slots(upkg *p, int e, pslot *out, int max)
+{
+    ptag t;
+    if (!prop_find(p, e, "MaterialSlotsData", &t) || strcmp(t.type, "ArrayProperty") || !t.sub ||
+        strcmp(t.sub, "StructProperty"))
+        return 0;
+    rd r = {p->ue, t.val + (size_t)t.size, t.val};
+    int32_t n = rd_i32(&r);
+    if (n <= 0) return 0;
+    ptag inner, x;
+    size_t at = r.at;
+    if (!tag_read(p, e, &at, &inner)) return 0;
+    at = inner.val;
+    int k = 0;
+    for (int32_t i = 0; i < n; i++) {
+        char mat[512] = "";
+        int first = k;
+        while (tag_read(p, e, &at, &x)) {
+            if (!strcmp(x.name, "PaletteMaterial") && !strcmp(x.type, "SoftObjectProperty") && x.size >= 8) {
+                snprintf(mat, sizeof mat, "%s", fname_at(p, p->ue + x.val));
+                mat[strcspn(mat, ".")] = 0;                     // the package
+            } else if (!strcmp(x.name, "MaterialSlotNames") && !strcmp(x.type, "ArrayProperty") && x.sub &&
+                       !strcmp(x.sub, "NameProperty") && x.size >= 4) {
+                rd q = {p->ue, x.val + (size_t)x.size, x.val};
+                int32_t c = rd_i32(&q);
+                for (int32_t j = 0; j < c && k < max; j++) {
+                    rd_need(&q, 8);
+                    snprintf(out[k++].slot, sizeof out->slot, "%s", fname_at(p, p->ue + q.at));
+                    q.at += 8;
+                }
+            }
+        }
+        for (int j = first; j < k; j++) snprintf(out[j].mat, sizeof out->mat, "%s", mat);
+    }
+    return k;
+}
+
+const char *upkg_import_package(upkg *p, int32_t idx)
+{
+    for (int depth = 0; idx < 0 && -idx - 1 < p->nimp && depth < 16; depth++) {
+        pimport *im = &p->imp[-idx - 1];
+        if (im->outer == 0) return upkg_name_at(p, im->name);
+        idx = im->outer;
+    }
+    return NULL;
 }

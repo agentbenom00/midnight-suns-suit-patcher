@@ -275,13 +275,22 @@ int game_index_everything;                                      // test tool: in
 static int index_filter(const char *dir, const char *name, void *ctx)
 {
     gindex *g = ctx;
-    // suits, palettes, the heroes' models and character templates (default hair), weapon items and weapons
+    // suits, Abbey outfits, palettes, the heroes' models and character templates (default hair; Heroes/, or Heros/
+    // in DLC_Deadpool), weapon items and weapons
     int want = game_index_everything || contains_ci(dir, "/Character/") || contains_ci(dir, "/TacticalOutfits/") || contains_ci(dir, "/Palettes/") ||
-               contains_ci(dir, "/Rarities/") || contains_ci(dir, "/Templates/Characters/Heroes/") ||
+               contains_ci(dir, "/Items/AbbeyOutfits/") ||
+               contains_ci(dir, "/Rarities/") || contains_ci(dir, "/Templates/Characters/Hero") ||
                contains_ci(dir, "/Templates/Items/Weapons/") || contains_ci(dir, "/Weapons/");
     for (int i = 0; i < g->nextra && !want; i++) want = !_stricmp(dir, g->extra[i]);
     if (!_stricmp(dir, "CodaGame/")) return !name || !_strnicmp(name, "AssetRegistry", 13);   // the registries
-    if (!want || _strnicmp(dir, "CodaGame/Content/", 17)) return 0;
+    // the shader library (its list of shader maps tells whether a material's compiled shaders are still there)
+    if (!want && !_stricmp(dir, "CodaGame/Content/")) return !name || !_stricmp(name, &GAME_SHADER_LIB[17]);
+    if (!want) return 0;
+    if (!_strnicmp(dir, "CodaGame/Plugins/", 17)) {                 // a plugin's content (DLC heroes such as Morbius)
+        const char *ct = strstr(dir, "/Content/");
+        return ct && !memchr(dir + 17, '/', ct - (dir + 17));
+    }
+    if (_strnicmp(dir, "CodaGame/Content/", 17)) return 0;
     (void)name;
     return 1;
 }
@@ -361,17 +370,29 @@ uint8_t *game_read(gindex *g, const char *path, size_t *n)
     return d;
 }
 
+uint8_t *game_read_head(gindex *g, const char *path, size_t want, size_t *n)
+{
+    int s = *slot_of(g, path);
+    if (!s) return NULL;
+    gfile *f = &g->files[s - 1];
+    *n = (size_t)(f->e.usize < (int64_t)want ? f->e.usize : (int64_t)want);
+    return pak_read_head(&g->paks[f->pak], &f->e, (int64_t)*n, 1);
+}
+
 void game_each(gindex *g, game_each_fn f, void *ctx)
 {
     for (int i = 0; i < g->n; i++) f(g->files[i].path, ctx);
 }
 
+// /Game/X is CodaGame/Content/X; a plugin's /DLC_Morbius/X is CodaGame/Plugins/DLC_Morbius/Content/X
 char *game_to_pak(const char *game_path, const char *ext)
 {
-    if (strncmp(game_path, "/Game/", 6)) sr_fail("not a game path: %s", game_path);
+    size_t ml = upkg_mount_len(game_path);
+    if (!ml) sr_fail("not a game path: %s", game_path);
     size_t n = strlen(game_path), e = strlen(ext);
-    char *s = xmalloc(n + e + 32);
-    sprintf(s, "CodaGame/Content/%s%s", game_path + 6, ext);
+    char *s = xmalloc(n + e + 48);
+    if (!strncmp(game_path, "/Game/", 6)) sprintf(s, "CodaGame/Content/%s%s", game_path + 6, ext);
+    else sprintf(s, "CodaGame/Plugins/%.*s/Content/%s%s", (int)(ml - 2), game_path + 1, game_path + ml, ext);
     return s;
 }
 
@@ -379,15 +400,23 @@ char *pak_to_game(const char *p)
 {
     const char *c = strstr(p, "/Content/");
     if (!c) return NULL;
-    // only <Project>/Content/ (CodaGame, or the MidnightSuns folder some mods use)
-    if (memchr(p, '/', c - p)) return NULL;
+    // only <Project>/Content/ (CodaGame, or the MidnightSuns folder some mods use), or a plugin's content,
+    // <Project>/Plugins/<Name>/Content/, mounted as /<Name>/
+    char mount[80] = "/Game/";
+    const char *pl = memchr(p, '/', c - p);
+    if (pl) {
+        if (_strnicmp(pl, "/Plugins/", 9)) return NULL;
+        const char *name = pl + 9;
+        if (memchr(name, '/', c - name) || c - name < 1 || c - name > 60) return NULL;
+        snprintf(mount, sizeof mount, "/%.*s/", (int)(c - name), name);
+    }
     const char *rest = c + 9;
-    size_t n = strlen(rest);
+    size_t n = strlen(rest), ml = strlen(mount);
     const char *dot = strrchr(rest, '.');
     if (dot && !strchr(dot, '/')) n = dot - rest;
-    char *s = xmalloc(n + 8);
-    memcpy(s, "/Game/", 6);
-    memcpy(s + 6, rest, n);
-    s[6 + n] = 0;
+    char *s = xmalloc(n + ml + 2);
+    memcpy(s, mount, ml);
+    memcpy(s + ml, rest, n);
+    s[ml + n] = 0;
     return s;
 }
